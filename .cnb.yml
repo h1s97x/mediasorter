@@ -1,9 +1,66 @@
 # MediaSorter CI 流水线
 # 核心: 构建产物 + GitHub/CNB 双向同步(参考 h1s97x/sduthesis)
+#
+# 性能优化（对应 ISSUE #2）:
+#   ① 持久化 Go 依赖缓存 —— 通过 docker.volumes 挂载 /root/go/pkg/mod 与 /root/.cache/go-build,
+#      避免每个 Stage 都从零 go:downloading fyne 全家桶
+#   ② 系统库预装进镜像 —— 通过 docker.build 引用 .ci/Dockerfile,交叉编译库(gcc/mingw/OpenGL等)
+#      一次装好并自动缓存,不再每次 apt-get 重复安装
+#   ③ GOPROXY 加速 —— 镜像内预设 goproxy.cn 国内源,海外自动回退 direct,拉取依赖更快
+#   ④ 编译并行化 —— 三平台 CLI / Linux GUI / Windows GUI 互不依赖,拆成并行 Job 充分利用多核
+#
 # 触发:
 #   main.push      -> 构建三平台 CLI + Win/Linux GUI + 测试,并同步到 GitHub
 #   $ tag_push     -> 对 v* tag 构建产物 + 创建 Release + 上传附件(非 v* 跳过)
 #   web_trigger    -> 手动从 GitHub 拉取同步(按钮在 .cnb/web_trigger.yml)
+
+# ===== 共用构建环境（docker.build 预装系统库 + 数据卷缓存 Go 依赖） =====
+.x-builder: &x-builder
+  build:
+    dockerfile: .ci/Dockerfile
+    by: [.ci/Dockerfile]
+  volumes:
+    - go-mod:/root/go/pkg/mod       # cow: 依赖模块缓存,跨构建持久复用(省时核心,避免每次重新下载)
+    - go-build:/root/.cache/go-build # cow: 编译缓存,跨构建持久复用(加速增量编译)
+
+# ===== 三平台 CLI 并行构建 Job =====
+.x-build-cli: &x-build-cli
+  script: |
+    set -e
+    cd go
+    go build -trimpath -o ../mediasort ./cmd/mediasort
+    GOOS=windows GOARCH=amd64 go build -trimpath -o ../mediasort.exe ./cmd/mediasort
+    GOOS=darwin  GOARCH=arm64 go build -trimpath -o ../mediasort-mac ./cmd/mediasort
+
+# ===== Linux GUI 并行构建 Job(fyne,需系统库) =====
+.x-build-gui-linux: &x-build-gui-linux
+  script: |
+    set -e
+    cd go
+    go build -trimpath -tags fyne -o ../mediasort-gui ./cmd/mediasort-gui
+
+# ===== Windows GUI 并行构建 Job(fyne,MinGW 交叉编译,静态链接免装 DLL) =====
+.x-build-gui-windows: &x-build-gui-windows
+  script: |
+    set -e
+    cd go
+    CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
+      go build -trimpath -tags fyne \
+      -ldflags "-H windowsgui -linkmode external -extldflags -static" \
+      -o ../mediasort-gui.exe ./cmd/mediasort-gui
+
+# ===== 并行构建 Stage(对象形式并行,充分利用多核) =====
+.x-build-stage: &x-build-stage
+  - name: build
+    jobs:
+      test:
+        script: |
+          set -e
+          cd go
+          go test ./internal/core/
+      build-cli: *x-build-cli
+      build-gui-linux: *x-build-gui-linux
+      build-gui-windows: *x-build-gui-windows
 
 main:
   push:
@@ -11,31 +68,9 @@ main:
       imports:
         - https://cnb.cool/h1s97x/secret-env/-/blob/main/env.yml
       docker:
-        image: golang:1.26-bookworm
+        <<: *x-builder
       stages:
-        - name: build cross-platform binaries
-          script: |
-            set -e
-            # 安装交叉编译依赖(MinGW 用于 Windows GUI;X11/Wayland 用于 Linux GUI)
-            apt-get update -qq
-            apt-get install -y -qq --no-install-recommends \
-              gcc gcc-mingw-w64-x86-64 \
-              libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev pkg-config
-            cd go
-            # 测试
-            go test ./internal/core/
-            # 三平台 CLI(纯 Go 交叉编译)
-            go build -trimpath -o ../mediasort ./cmd/mediasort
-            GOOS=windows GOARCH=amd64 go build -trimpath -o ../mediasort.exe ./cmd/mediasort
-            GOOS=darwin  GOARCH=arm64 go build -trimpath -o ../mediasort-mac ./cmd/mediasort
-            # Linux GUI(fyne,需系统库)
-            go build -trimpath -tags fyne -o ../mediasort-gui ./cmd/mediasort-gui
-            # Windows GUI(fyne,MinGW 交叉编译,静态链接免装 DLL)
-            CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
-              go build -trimpath -tags fyne \
-              -ldflags "-H windowsgui -linkmode external -extldflags -static" \
-              -o ../mediasort-gui.exe ./cmd/mediasort-gui
-            cd ..
+        - *x-build-stage
         - name: sync to github
           image: tencentcom/git-sync
           settings:
@@ -53,7 +88,7 @@ $:
       imports:
         - https://cnb.cool/h1s97x/secret-env/-/blob/main/env.yml
       docker:
-        image: golang:1.26-bookworm
+        <<: *x-builder
       stages:
         - name: check tag is v*
           # 仅对 v* 格式的 release tag 执行构建发布;其它 tag 直接跳过
@@ -62,24 +97,7 @@ $:
               v*) ;;
               *) echo "非 release tag($CNB_BRANCH),跳过发布"; exit 0 ;;
             esac
-        - name: build cross-platform binaries
-          script: |
-            set -e
-            apt-get update -qq
-            apt-get install -y -qq --no-install-recommends \
-              gcc gcc-mingw-w64-x86-64 \
-              libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev pkg-config
-            cd go
-            go test ./internal/core/
-            go build -trimpath -o ../mediasort ./cmd/mediasort
-            GOOS=windows GOARCH=amd64 go build -trimpath -o ../mediasort.exe ./cmd/mediasort
-            GOOS=darwin  GOARCH=arm64 go build -trimpath -o ../mediasort-mac ./cmd/mediasort
-            go build -trimpath -tags fyne -o ../mediasort-gui ./cmd/mediasort-gui
-            CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
-              go build -trimpath -tags fyne \
-              -ldflags "-H windowsgui -linkmode external -extldflags -static" \
-              -o ../mediasort-gui.exe ./cmd/mediasort-gui
-            cd ..
+        - *x-build-stage
         - name: create release
           type: git:release
           options:
