@@ -8,8 +8,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -39,6 +41,9 @@ type Options struct {
 	// OnProgress 进度回调,可空。done=已处理, total=本次总文件数。
 	// 注:total 为去重前的扫描总数,去重后实际处理数可能更少。
 	OnProgress func(done, total int)
+	// Concurrency 归档阶段并行 worker 数量。<=0 时自动取 runtime.NumCPU();
+	// 显式设为 1 可强制串行(保持日志/命名顺序,如 --dry-run)。
+	Concurrency int
 }
 
 // Result 处理结果
@@ -170,21 +175,59 @@ func Run(opt Options, log func(string)) Result {
 	}
 
 	// ---- 归档 ----
-	progress := func(done int) {
+	// 并发模型: 固定数量的 worker 并行处理文件。命名序号(counter/base)、Result 统计
+	// 等共享状态通过互斥锁保护; GetCaptureTime 与 copyFile/MkdirAll 这类 IO/CPU 混合
+	// 负载在锁外并行执行,充分利用多核。Concurrency<=0 取 runtime.NumCPU();
+	// DryRun 无实际 IO,强制串行以保持日志/预览顺序。
+	concurrency := opt.Concurrency
+	if opt.DryRun {
+		concurrency = 1
+	} else if concurrency <= 0 {
+		concurrency = runtime.NumCPU()
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	// 上限保护: 避免 --jobs= 传入过大值创建海量 goroutine。实际并发以文件数为准。
+	const maxConcurrency = 64
+	if concurrency > maxConcurrency {
+		concurrency = maxConcurrency
+	}
+
+	var mu sync.Mutex
+	var progressMu sync.Mutex // 独立进度锁: 慢 OnProgress 回调不阻塞 worker 临界区
+	var done int
+	var hasTimeSpan bool
+	counter := map[string]int{}
+
+	// progress 用独立进度锁调用,保证 OnProgress 回调不被并发触发(如 GUI 的 fyne.Do 需单线程),
+	// 同时慢回调不会阻塞 worker 进入命名/统计临界区。
+	progress := func() {
 		if opt.OnProgress != nil {
+			progressMu.Lock()
 			opt.OnProgress(done, len(files))
+			progressMu.Unlock()
 		}
 	}
-	counter := map[string]int{}
-	for i, f := range files {
-		progress(i)
-		t, srcTag, ok := GetCaptureTime(f)
-		// HEIC/HEIF 的 EXIF 提取失败降级到文件名/mtime 时,输出明确降级提示便于排查
+
+	// 处理单个文件。共享状态(命名序号/统计/进度)在 mu 保护下访问;
+	// GetCaptureTime、HeifExifStatus 与 copyFile/MkdirAll 这类 IO/CPU 混合负载在锁外并行。
+	process := func(f string) {
+		t, srcTag, ok := GetCaptureTime(f) // 只读 CPU 计算,可并行
+
+		// HEIC/HEIF 的 EXIF 提取失败降级到文件名/mtime 时,输出明确降级提示便于排查。
+		// HeifExifStatus 解析 HEIF box(IO/CPU 密集),在锁外并行执行。
+		var degradeMsg string
 		extLower := strings.ToLower(filepath.Ext(f))
 		if (extLower == ".heic" || extLower == ".heif") && srcTag != "EXIF" {
 			if kind, desc := HeifExifStatus(f); kind != "" {
-				emit(fmt.Sprintf("[降级] %s,已降级为%s来源(%s): %s", desc, srcTag, kind, f))
+				degradeMsg = fmt.Sprintf("[降级] %s,已降级为%s来源(%s): %s", desc, srcTag, kind, f)
 			}
+		}
+
+		mu.Lock()
+		if degradeMsg != "" {
+			emit(degradeMsg)
 		}
 		// 按录制日期筛选: 只处理符合要求来源的文件
 		if !matchesTimeFilter(srcTag, ok, opt.TimeFilter) {
@@ -193,21 +236,28 @@ func Run(opt Options, log func(string)) Result {
 			} else if opt.TimeFilter == "none" {
 				emit("[筛选] 有录制日期,跳过: " + f)
 			}
-			continue
+			done++
+			progress()
+			mu.Unlock()
+			return
 		}
 		if !ok {
 			emit("[跳过] 无法读取任何时间: " + f)
 			res.Failed++
-			continue
+			done++
+			progress()
+			mu.Unlock()
+			return
 		}
 		t = t.Add(time.Duration(opt.Offset) * time.Second)
 		res.SourceCount[srcTag]++
-		if res.Processed == 0 || t.Before(res.TimeSpanMin) {
+		if !hasTimeSpan || t.Before(res.TimeSpanMin) {
 			res.TimeSpanMin = t
 		}
-		if res.Processed == 0 || t.After(res.TimeSpanMax) {
+		if !hasTimeSpan || t.After(res.TimeSpanMax) {
 			res.TimeSpanMax = t
 		}
+		hasTimeSpan = true
 
 		base := baseName(f, t, opt) // 不含扩展名
 		ext := strings.ToLower(filepath.Ext(f))
@@ -217,7 +267,7 @@ func Run(opt Options, log func(string)) Result {
 		sub := relDir(t, opt)
 		target := filepath.Join(opt.Dst, sub, newName)
 
-		// 同名冲突:递增序号,绝不覆盖
+		// 同名冲突:递增序号,绝不覆盖。在锁内完成序号保留,确保并发下不重名。
 		guard := 0
 		for _, err := os.Stat(target); err == nil && guard < 999; _, err = os.Stat(target) {
 			seq++
@@ -225,12 +275,21 @@ func Run(opt Options, log func(string)) Result {
 			target = filepath.Join(opt.Dst, sub, newName)
 			guard++
 		}
+		// 关键: 将最终保留的序号回写 counter,保证后续 counter 分配从当前磁盘已用序号继续,
+		// 避免并发下另一 worker 分配到与本次已保留 target 相同的 seq 而相互覆盖。
+		counter[base] = seq
+		mu.Unlock()
 
+		// ---- 锁外: 实际 IO,多 worker 并行 ----
 		if !opt.DryRun {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				mu.Lock()
 				emit("[失败] " + f + " : " + err.Error())
 				res.Failed++
-				continue
+				done++
+				progress()
+				mu.Unlock()
+				return
 			}
 			var err error
 			if opt.Move {
@@ -239,11 +298,17 @@ func Run(opt Options, log func(string)) Result {
 				err = copyFile(f, target)
 			}
 			if err != nil {
+				mu.Lock()
 				emit("[失败] " + f + " : " + err.Error())
 				res.Failed++
-				continue
+				done++
+				progress()
+				mu.Unlock()
+				return
 			}
 		}
+
+		mu.Lock()
 		prefix := ""
 		if opt.DryRun {
 			prefix = "[预览] "
@@ -251,8 +316,31 @@ func Run(opt Options, log func(string)) Result {
 		emit(fmt.Sprintf("%s[%s] %s -> %s", prefix, t.Format("2006-01-02 15:04:05"),
 			filepath.Base(f), filepath.Join(sub, newName)))
 		res.Processed++
+		done++
+		progress()
+		mu.Unlock()
 	}
-	progress(len(files))
+
+	jobs := make(chan string)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for f := range jobs {
+				process(f)
+			}
+		}()
+	}
+	for _, f := range files {
+		jobs <- f
+	}
+	close(jobs)
+	wg.Wait()
+	if done < len(files) { // 兜底: 确保进度归满
+		done = len(files)
+	}
+	progress()
 	return res
 }
 

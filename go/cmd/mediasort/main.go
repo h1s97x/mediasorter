@@ -12,6 +12,7 @@
 //	--offset N    时间偏移 N 秒(修正机内时间)
 //	--year        仅按年分目录
 //	--day         按 年/月/日 分目录
+//	--jobs N      并发 worker 数(默认 CPU 核数;=1 串行)
 package main
 
 import (
@@ -50,6 +51,12 @@ func main() {
 		case strings.HasPrefix(a, "--offset="):
 			if v, err := strconv.Atoi(strings.TrimPrefix(a, "--offset=")); err == nil {
 				opt.Offset = v
+			}
+		case strings.HasPrefix(a, "--jobs="):
+			if v, err := strconv.Atoi(strings.TrimPrefix(a, "--jobs=")); err == nil && v > 0 {
+				opt.Concurrency = v
+			} else {
+				fmt.Println("警告: --jobs 需为正整数,忽略该值")
 			}
 		case strings.HasPrefix(a, "--"):
 			fmt.Println("未知选项:", a)
@@ -103,7 +110,7 @@ func printHelp() {
 	fmt.Println("用法一(最简单): 把照片文件夹拖到本程序图标上,松手")
 	fmt.Println("  结果生成在本程序旁边的『照片整理』文件夹,按 年/月 排好")
 	fmt.Println("用法二(命令行): mediasort <源文件夹> [目标文件夹] [选项]")
-	fmt.Println("  选项: --move | --no-dedupe | --dry-run | --offset=秒 | --year | --day")
+	fmt.Println("  选项: --move | --no-dedupe | --dry-run | --offset=秒 | --year | --day | --jobs=并发数")
 }
 
 func waitExit() {
