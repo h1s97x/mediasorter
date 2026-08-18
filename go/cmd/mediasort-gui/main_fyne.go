@@ -8,6 +8,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -130,6 +131,8 @@ func main() {
 
 	// 记录去重后总文件数,供进度条百分比使用
 	var totalFiles int64
+	// cancelFunc 保存当前运行的取消函数,供取消按钮调用(每次 run 开始时重新赋值)。
+	var cancelFunc context.CancelFunc
 
 	srcBtn := widget.NewButton("选择", func() {
 		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
@@ -319,6 +322,12 @@ func main() {
 		logEntry.Enable()
 		logEntry.SetText(fmt.Sprintf("模式: %s\n输入: %s\n输出: %s\n\n", modeLabel, opt.Src, opt.Dst))
 
+		// 创建可取消 context,注入 core.Run 以支持安全中断。
+		ctx, cancel := context.WithCancel(context.Background())
+		cancelFunc = cancel
+		opt.Ctx = ctx
+		cancelBtn.SetText("取消")
+
 		ch := make(chan string, 256)
 		doneCh := make(chan core.Result, 1)
 
@@ -341,7 +350,10 @@ func main() {
 				if total <= 0 {
 					total = int64(res.Processed)
 				}
-				if opt.DryRun {
+				if res.Cancelled {
+					status.SetText(fmt.Sprintf("已取消: 本次已处理 %d / %d 个, 去重 %d, 失败 %d",
+						res.Processed, total, res.Duplicates, res.Failed))
+				} else if opt.DryRun {
 					status.SetText(fmt.Sprintf("预览完成: 将处理 %d / %d 个, 去重 %d, 失败 %d",
 						res.Processed, total, res.Duplicates, res.Failed))
 					status.SetText(status.Text + "\n以上是预览结果,未做任何复制/移动。确认无误后点『开始整理』正式执行。")
@@ -359,6 +371,8 @@ func main() {
 						res.SourceCount["mtime"]))
 				}
 				setButtonsRunning(false)
+				cancelFunc = nil
+				cancelBtn.SetText("取消")
 			})
 		}()
 	}
@@ -386,7 +400,13 @@ func main() {
 	}
 
 	cancelBtn.OnTapped = func() {
-		dialog.ShowInformation("提示", "Go 版当前不支持安全中断,请等待本次运行结束。\n(如需中断可关闭窗口)", w)
+		if cancelFunc == nil {
+			return
+		}
+		// 触发取消信号,core.Run 会在安全点停止后续文件处理。
+		cancelFunc()
+		cancelBtn.SetText("正在取消…")
+		cancelBtn.Disable()
 	}
 
 	// 拖放支持:把文件夹拖到窗口上,自动填入源文件夹

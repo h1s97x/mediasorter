@@ -2,6 +2,7 @@
 package core
 
 import (
+	"context"
 	"crypto/md5"
 	"fmt"
 	"io"
@@ -45,6 +46,10 @@ type Options struct {
 	// Concurrency 归档阶段并行 worker 数量。<=0 时自动取 runtime.NumCPU();
 	// 显式设为 1 可强制串行(保持日志/命名顺序,如 --dry-run)。
 	Concurrency int
+	// Ctx 可选的取消信号。nil 时等价于 context.Background(),行为与旧版一致。
+	// 取消后会在处理循环中尽早停止后续文件处理,已复制/移动的单个文件会等待其完成后安全退出,
+	// 保证不产生半成品。取消状态通过 Result.Cancelled 返回。
+	Ctx context.Context
 	// OnScanProgress 扫描阶段进度回调,可空。scanned=已遍历到的媒体文件数(累计)。
 	// 扫描是递归遍历,事前不知道总数,故只上报已扫描数量,用于展示"正在扫描…N 个"。
 	OnScanProgress func(scanned int)
@@ -58,6 +63,7 @@ type Result struct {
 	Processed   int
 	Duplicates  int
 	Failed      int
+	Cancelled   bool // true 表示运行因取消而提前终止(仍可能已处理部分文件)
 	TimeSpanMin time.Time
 	TimeSpanMax time.Time
 	SourceCount map[string]int
@@ -141,6 +147,11 @@ func Run(opt Options, log func(string)) Result {
 			log(s)
 		}
 	}
+	// 取消信号: nil 时使用 Background,保持向后兼容(等价旧版不中断行为)。
+	ctx := opt.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if opt.Offset == 0 {
 		opt.Offset = 0
 	}
@@ -177,6 +188,11 @@ func Run(opt Options, log func(string)) Result {
 		phase("dedupe")
 		bySize := map[int64][]string{}
 		for _, f := range files {
+			if ctx.Err() != nil {
+				res.Cancelled = true
+				emit("已取消")
+				return res
+			}
 			if fi, err := os.Stat(f); err == nil {
 				bySize[fi.Size()] = append(bySize[fi.Size()], f)
 			}
@@ -325,9 +341,15 @@ func Run(opt Options, log func(string)) Result {
 			if opt.Move {
 				err = os.Rename(f, target)
 			} else {
-				err = copyFile(f, target)
+				err = copyFile(f, target, ctx)
 			}
 			if err != nil {
+				// 取消导致的错误不算失败: 取消状态已在主循环中标记,半成品已删除。
+				// 用 ctx.Err()!=nil 判断,兼容 WithCancel(返回 Canceled) 与
+				// WithDeadline/WithTimeout(返回 DeadlineExceeded) 两种取消来源。
+				if ctx.Err() != nil {
+					return
+				}
 				mu.Lock()
 				emit("[失败] " + f + " : " + err.Error())
 				res.Failed++
@@ -358,13 +380,25 @@ func Run(opt Options, log func(string)) Result {
 		go func() {
 			defer wg.Done()
 			for f := range jobs {
+				if ctx.Err() != nil {
+					// 取消: 不再处理新文件;已取到的当前文件由 process 内部安全完成。
+					return
+				}
 				process(f)
 			}
 		}()
 	}
+	// 分发: 用 select 使主 goroutine 能在取消时提前停止发送,避免死锁。
 	for _, f := range files {
-		jobs <- f
+		select {
+		case <-ctx.Done():
+			res.Cancelled = true
+			emit("已取消")
+			goto drain
+		case jobs <- f:
+		}
 	}
+drain:
 	close(jobs)
 	wg.Wait()
 	if done < len(files) { // 兜底: 确保进度归满
@@ -375,8 +409,9 @@ func Run(opt Options, log func(string)) Result {
 	return res
 }
 
-// copyFile 流式复制,大文件不占内存
-func copyFile(src, dst string) error {
+// copyFile 流式复制,大文件不占内存。复制过程中检查 ctx 取消:若取消,
+// 删除已写出的半成品文件并返回取消错误,保证不产生脏数据。
+func copyFile(src, dst string, ctx context.Context) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -386,9 +421,27 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil {
-		return err
+	// 64KB 分块复制,便于在复制过程中检查取消信号。
+	buf := make([]byte, 64*1024)
+	for {
+		if ctx.Err() != nil {
+			// 取消: 删除半成品,返回取消错误,由调用方统一处理。
+			out.Close()
+			os.Remove(dst)
+			return ctx.Err()
+		}
+		n, rerr := in.Read(buf)
+		if n > 0 {
+			if _, werr := out.Write(buf[:n]); werr != nil {
+				return werr
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
 	}
 	return out.Close()
 }
