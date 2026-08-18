@@ -20,8 +20,8 @@
     dockerfile: .ci/Dockerfile
     by: [.ci/Dockerfile]
   volumes:
-    - go-mod:/root/go/pkg/mod       # cow: 依赖模块缓存,跨构建持久复用(省时核心,避免每次重新下载)
-    - go-build:/root/.cache/go-build # cow: 编译缓存,跨构建持久复用(加速增量编译)
+    - /root/go/pkg/mod        # cow: 依赖模块缓存,跨构建持久复用(省时核心,避免每次重新下载)
+    - /root/.cache/go-build   # cow: 编译缓存,跨构建持久复用(加速增量编译)
 
 # ===== 三平台 CLI 并行构建 Job =====
 .x-build-cli: &x-build-cli
