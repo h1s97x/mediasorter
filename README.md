@@ -63,6 +63,7 @@ mediasort <源文件夹> [目标文件夹] [选项]
 - **递归扫描**——可指向整个 U 盘;自动排除输出目录,防止递归
 - **拍摄时间四级兜底**:
   1. 照片 EXIF `DateTimeOriginal`(手写 JPEG / HEIC / TIFF 解析,无第三方库)
+     - HEIC/HEIF 走 ISO BMFF 的 `meta/Exif` 提取;解析失败(无 Exif item 或数据不完整)时降级到文件名/mtime 兜底,并在日志中标记来源与降级提示
   2. 视频 MP4 `creation_time`(`moov/mvhd`,UTC 自动转本地,东八区不差 8 小时)
   3. 文件名时间戳(`IMG_20260817_104121`、`Screenshot_2026-08-10-153212`、微信 unix 秒/毫秒戳)
   4. 文件创建/修改时间(取较旧者,日志中标记来源)

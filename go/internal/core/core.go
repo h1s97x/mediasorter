@@ -179,6 +179,13 @@ func Run(opt Options, log func(string)) Result {
 	for i, f := range files {
 		progress(i)
 		t, srcTag, ok := GetCaptureTime(f)
+		// HEIC/HEIF 的 EXIF 提取失败降级到文件名/mtime 时,输出明确降级提示便于排查
+		extLower := strings.ToLower(filepath.Ext(f))
+		if (extLower == ".heic" || extLower == ".heif") && srcTag != "EXIF" {
+			if kind, desc := HeifExifStatus(f); kind != "" {
+				emit(fmt.Sprintf("[降级] %s,已降级为%s来源(%s): %s", desc, srcTag, kind, f))
+			}
+		}
 		// 按录制日期筛选: 只处理符合要求来源的文件
 		if !matchesTimeFilter(srcTag, ok, opt.TimeFilter) {
 			if opt.TimeFilter == "has" {

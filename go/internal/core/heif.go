@@ -1,7 +1,9 @@
 // HEIF/HEIC EXIF 解析(纯 Go,手写 ISO BMFF 容器解析,零第三方依赖)
 // 定位链路: 顶层找 meta -> 在 meta 内用 iinf 找 item_type=="Exif" 的 item_ID
-//        -> 用 iloc 按 item_ID 查 extent(offset+length) -> 从 mdat 提取数据
-//        -> EXIF 数据块前 4 字节为大端 exif_tiff_header_offset,其后是 TIFF -> 复用 parseTiffDateTime
+//
+//	-> 用 iloc 按 item_ID 查 extent(offset+length) -> 从 mdat 提取数据
+//	-> EXIF 数据块前 4 字节为大端 exif_tiff_header_offset,其后是 TIFF -> 复用 parseTiffDateTime
+//
 // 覆盖 HEIC/HEIF(JPEG EXIF 在 APP1 段,结构不同,走 exif.go)。
 package core
 
@@ -11,11 +13,29 @@ import (
 	"time"
 )
 
-// parseHeifExifTime 读取 HEIC/HEIF 的 Exif 数据里的 DateTimeOriginal
-func parseHeifExifTime(path string) (time.Time, bool) {
+// heifExifStatusKind 表示 HEIC/HEIF 的 Exif 提取状态
+const (
+	// heifNoExif 文件正常但未包含 Exif 数据(无 Exif item / 无 mdat / 无有效 extent)
+	heifNoExif = "no-exif"
+	// heifParseFailed 文件应含 Exif 但读取或结构不完整
+	heifParseFailed = "parse-failed"
+)
+
+// heifStatus 描述 HEIC/HEIF 的 Exif 提取状态。
+// ok=true 时 t 为解析出的拍摄时间,kind/desc 为空;
+// ok=false 时 kind 为 heifNoExif 或 heifParseFailed。
+type heifStatus struct {
+	t    time.Time
+	ok   bool
+	kind string
+	desc string
+}
+
+// heifExifStatus 读取并解析 HEIC/HEIF 的 Exif,返回提取状态。
+func heifExifStatus(path string) heifStatus {
 	f, err := os.Open(path)
 	if err != nil {
-		return time.Time{}, false
+		return heifStatus{ok: false, kind: heifParseFailed, desc: "HEIC 解析失败(无法打开文件)"}
 	}
 	defer f.Close()
 
@@ -34,42 +54,62 @@ func parseHeifExifTime(path string) (time.Time, bool) {
 			// 读取 meta 负载(version/flags + 子 box)
 			payload := make([]byte, boxSize-8)
 			if _, err := f.Read(payload); err != nil {
-				break
+				return heifStatus{ok: false, kind: heifParseFailed, desc: "HEIC 解析失败(meta 读取异常)"}
 			}
 			meta = payload
 			continue
 		}
 		// 跳到下一个 box:已读过 8 字节头,需跳过剩余 boxSize-8 字节
 		if _, err := f.Seek(int64(boxSize-8), 1); err != nil {
-			break
+			return heifStatus{ok: false, kind: heifParseFailed, desc: "HEIC 解析失败(容器读取异常)"}
 		}
 	}
 
 	if len(meta) == 0 || mdatDataStart < 0 {
-		return time.Time{}, false
+		// 无 meta 或 mdat,视为该 HEIC 确实不含 Exif
+		return heifStatus{ok: false, kind: heifNoExif, desc: "HEIC 无 Exif 数据(无 meta/mdat)"}
 	}
 
 	loc, ok := extractExifLocFromMeta(meta)
 	if !ok {
-		return time.Time{}, false
+		// 找不到 Exif item,说明文件正常但无 Exif 元数据
+		return heifStatus{ok: false, kind: heifNoExif, desc: "HEIC 无 Exif 数据(未找到 Exif item)"}
 	}
 	// 从 mdat 按偏移读取 EXIF 数据块
 	if _, err := f.Seek(mdatDataStart+loc.offset, 0); err != nil {
-		return time.Time{}, false
+		return heifStatus{ok: false, kind: heifParseFailed, desc: "HEIC 解析失败(数据偏移定位异常)"}
 	}
 	buf := make([]byte, loc.length)
 	if _, err := f.Read(buf); err != nil {
-		return time.Time{}, false
+		return heifStatus{ok: false, kind: heifParseFailed, desc: "HEIC 解析失败(Exif 数据读取不完整)"}
 	}
 	// EXIF 数据块: 前 4 字节 = exif_tiff_header_offset(大端),其后为 TIFF 数据
 	if len(buf) < 4 {
-		return time.Time{}, false
+		return heifStatus{ok: false, kind: heifParseFailed, desc: "HEIC 解析失败(Exif 数据块过短)"}
 	}
 	tiffOff := int(binary.BigEndian.Uint32(buf[:4]))
 	if tiffOff < 4 || tiffOff >= len(buf) {
-		return time.Time{}, false
+		return heifStatus{ok: false, kind: heifParseFailed, desc: "HEIC 解析失败(TIFF 偏移无效)"}
 	}
-	return parseTiffDateTime(buf[tiffOff:])
+	t, ok := parseTiffDateTime(buf[tiffOff:])
+	if !ok {
+		return heifStatus{ok: false, kind: heifParseFailed, desc: "HEIC 解析失败(TIFF 内无 DateTimeOriginal)"}
+	}
+	return heifStatus{t: t, ok: true}
+}
+
+// HeifExifStatus 供 core.Run 判断 HEIC/HEIF 的 Exif 降级原因。
+// 返回 (kind, desc):kind 为 "no-exif" 表示文件无 Exif 数据,
+// "parse-failed" 表示解析失败;文件非 HEIC/HEIF 或解析成功时返回 ("","")。
+func HeifExifStatus(path string) (kind, desc string) {
+	st := heifExifStatus(path)
+	return st.kind, st.desc
+}
+
+// parseHeifExifTime 读取 HEIC/HEIF 的 Exif 数据里的 DateTimeOriginal
+func parseHeifExifTime(path string) (time.Time, bool) {
+	st := heifExifStatus(path)
+	return st.t, st.ok
 }
 
 // exifLoc 描述 EXIF 数据块在 mdat 数据区中的偏移和长度
@@ -185,9 +225,12 @@ func findExifItemID(iinf []byte) (int, bool) {
 
 // parseInfe 解析单个 infe box,返回 item_ID 和是否为 Exif 类型。
 // infe 是 full box;version 0/1 布局:
-//   [4 version/flags][2 item_ID][2 protection_index][4 item_type]...
+//
+//	[4 version/flags][2 item_ID][2 protection_index][4 item_type]...
+//
 // version >=2 在 item_type 前有 2 字节 reserved + 2 字节 protection_index:
-//   [4 version/flags][2 item_ID][2 protection_index][2 reserved][2 flags][4 item_type]...
+//
+//	[4 version/flags][2 item_ID][2 protection_index][2 reserved][2 flags][4 item_type]...
 func parseInfe(infe []byte) (int, bool) {
 	if len(infe) < 12 {
 		return -1, false

@@ -1,5 +1,6 @@
 // JPEG EXIF 解析(纯 Go,手写 APP1 -> TIFF -> ExifIFD -> DateTimeOriginal)
-// 覆盖 JPG/JPEG;HEIC 不在 EXIF 段内,走文件名/mtime 兜底
+// 覆盖 JPG/JPEG;HEIC/HEIF 走 ISO BMFF 的 meta/Exif 提取(见 heif.go),
+// 解析失败时降级到文件名/mtime 兜底。
 package core
 
 import (
