@@ -116,8 +116,11 @@ func main() {
 	logEntry.SetPlaceHolder("运行日志会显示在这里")
 
 	// 进度条 + 状态
+	// progress: 处理阶段的确定进度条; scanProgress: 扫描阶段的无限进度条(动画)
 	progress := widget.NewProgressBar()
 	progress.SetValue(0)
+	scanProgress := widget.NewProgressBarInfinite()
+	scanProgress.Hide() // 默认隐藏,扫描阶段才显示
 	status := widget.NewLabel("就绪。可先点『预览』查看效果,确认后再『开始整理』。")
 
 	previewBtn := widget.NewButton("预览", nil)
@@ -268,6 +271,37 @@ func main() {
 					progress.SetValue(p)
 				})
 			},
+			OnScanProgress: func(scanned int) {
+				// 扫描阶段: 只报已扫描到的媒体文件数,进度条为无限动画
+				fyne.Do(func() {
+					status.SetText(fmt.Sprintf("正在扫描…已发现 %d 个媒体文件(大目录可能较慢,请稍候)", scanned))
+				})
+			},
+			OnPhase: func(phase string) {
+				fyne.Do(func() {
+					switch phase {
+					case "scan":
+						// 扫描阶段: 显示无限进度条动画,隐藏确定进度条
+						scanProgress.Show()
+						scanProgress.Start()
+						progress.Hide()
+						status.SetText("正在扫描…(递归遍历,大目录可能需要一些时间)")
+					case "dedupe":
+						status.SetText("正在去重…(计算 MD5,可能较慢)")
+					case "process":
+						// 进入处理阶段: 恢复为确定进度条,隐藏无限进度条
+						scanProgress.Stop()
+						scanProgress.Hide()
+						progress.Show()
+						progress.SetValue(0)
+						status.SetText("正在整理…")
+					case "done":
+						scanProgress.Stop()
+						scanProgress.Hide()
+						progress.Show()
+					}
+				})
+			},
 		}, ""
 	}
 
@@ -275,6 +309,10 @@ func main() {
 	run := func(opt core.Options, modeLabel string) {
 		setButtonsRunning(true)
 		atomic.StoreInt64(&totalFiles, 0)
+		// 重置进度条状态(默认显示确定进度条,隐藏无限进度条)
+		scanProgress.Stop()
+		scanProgress.Hide()
+		progress.Show()
 		progress.SetValue(0)
 		status.SetText("正在扫描…")
 		logEntry.SetText("")
@@ -386,6 +424,7 @@ func main() {
 			widget.NewLabel("  文件名后缀:"), suffixEntry),
 		container.NewHBox(previewBtn, startBtn, cancelBtn),
 		progress,
+		scanProgress,
 		status,
 		container.NewVBox(widget.NewLabel("日志:"), logEntry),
 	)

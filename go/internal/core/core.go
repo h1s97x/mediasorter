@@ -39,11 +39,18 @@ type Options struct {
 	//   "none"  = 仅处理无录制日期(只能靠文件名/文件时间兜底)的文件
 	TimeFilter string
 	// OnProgress 进度回调,可空。done=已处理, total=本次总文件数。
-	// 注:total 为去重前的扫描总数,去重后实际处理数可能更少。
+	// 注:total 为本次要处理的总数(去重后;扫描得到原始总数后去重会减少),
+	// 进度条应以 OnProgress 的 total 为分母,避免去重前后进度跳变。
 	OnProgress func(done, total int)
 	// Concurrency 归档阶段并行 worker 数量。<=0 时自动取 runtime.NumCPU();
 	// 显式设为 1 可强制串行(保持日志/命名顺序,如 --dry-run)。
 	Concurrency int
+	// OnScanProgress 扫描阶段进度回调,可空。scanned=已遍历到的媒体文件数(累计)。
+	// 扫描是递归遍历,事前不知道总数,故只上报已扫描数量,用于展示"正在扫描…N 个"。
+	OnScanProgress func(scanned int)
+	// OnPhase 阶段回调,可空。phase 取值为 "scan" | "dedupe" | "process" | "done"。
+	// 便于 GUI/CLI 切换不同阶段的进度展示(如扫描用不确定进度条,处理用确定进度条)。
+	OnPhase func(phase string)
 }
 
 // Result 处理结果
@@ -81,6 +88,12 @@ func isMedia(ext string, exts map[string]bool) bool {
 // Scan 递归扫描 src 下的媒体文件,排除 dst 自身(防递归)。
 // exts 为 nil 表示处理全部支持的媒体格式;非 nil 时仅处理白名单内的扩展名。
 func Scan(src, dst string, exts map[string]bool) []string {
+	return ScanWithProgress(src, dst, exts, nil)
+}
+
+// ScanWithProgress 同 Scan,但会在遍历过程中通过 onScan 回调已扫描到的媒体文件数(累计)。
+// onScan 可空。用于扫描阶段提供进度反馈(递归遍历事前未知总数,故只报已扫描数)。
+func ScanWithProgress(src, dst string, exts map[string]bool, onScan func(scanned int)) []string {
 	dstAbs, _ := filepath.Abs(dst)
 	var files []string
 	filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
@@ -97,6 +110,9 @@ func Scan(src, dst string, exts map[string]bool) []string {
 		ext := strings.ToLower(filepath.Ext(p))
 		if isMedia(ext, exts) {
 			files = append(files, p)
+			if onScan != nil {
+				onScan(len(files))
+			}
 		}
 		return nil
 	})
@@ -128,6 +144,11 @@ func Run(opt Options, log func(string)) Result {
 	if opt.Offset == 0 {
 		opt.Offset = 0
 	}
+	phase := func(p string) {
+		if opt.OnPhase != nil {
+			opt.OnPhase(p)
+		}
+	}
 	// 格式选择: opt.Extensions 为空表示全部;非空则仅处理白名单内的扩展名
 	var exts map[string]bool
 	if len(opt.Extensions) > 0 {
@@ -136,9 +157,16 @@ func Run(opt Options, log func(string)) Result {
 			exts[strings.ToLower(e)] = true
 		}
 	}
-	files := Scan(opt.Src, opt.Dst, exts)
+	// ---- 扫描:递归遍历并提供进度反馈 ----
+	phase("scan")
+	files := ScanWithProgress(opt.Src, opt.Dst, exts, func(scanned int) {
+		if opt.OnScanProgress != nil {
+			opt.OnScanProgress(scanned)
+		}
+	})
 	if len(files) == 0 {
 		emit("未找到任何照片或视频文件")
+		phase("done")
 		return res
 	}
 	emit(fmt.Sprintf("共发现 %d 个媒体文件", len(files)))
@@ -146,6 +174,7 @@ func Run(opt Options, log func(string)) Result {
 	// ---- 去重:按大小分组,同大小才算 MD5(性能关键) ----
 	var kept []string
 	if opt.Dedupe {
+		phase("dedupe")
 		bySize := map[int64][]string{}
 		for _, f := range files {
 			if fi, err := os.Stat(f); err == nil {
@@ -175,6 +204,7 @@ func Run(opt Options, log func(string)) Result {
 	}
 
 	// ---- 归档 ----
+	phase("process")
 	// 并发模型: 固定数量的 worker 并行处理文件。命名序号(counter/base)、Result 统计
 	// 等共享状态通过互斥锁保护; GetCaptureTime 与 copyFile/MkdirAll 这类 IO/CPU 混合
 	// 负载在锁外并行执行,充分利用多核。Concurrency<=0 取 runtime.NumCPU();
@@ -341,6 +371,7 @@ func Run(opt Options, log func(string)) Result {
 		done = len(files)
 	}
 	progress()
+	phase("done")
 	return res
 }
 

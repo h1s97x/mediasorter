@@ -52,3 +52,36 @@ func TestScanFormatFilter(t *testing.T) {
 		t.Fatalf("期望 0 个,实际 %v", none)
 	}
 }
+
+// TestScanWithProgress 验证 ScanWithProgress 在遍历过程中上报累计扫描数。
+func TestScanWithProgress(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	// 建一个子目录,验证递归遍历
+	if err := os.MkdirAll(filepath.Join(src, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	files := []string{"a.jpg", "b.png", filepath.Join("sub", "c.mp4")}
+	for _, f := range files {
+		if err := os.WriteFile(filepath.Join(src, f), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var saw []int
+	got := ScanWithProgress(src, dst, nil, func(n int) { saw = append(saw, n) })
+	if len(got) != 3 {
+		t.Fatalf("期望 3 个媒体文件,实际 %d", len(got))
+	}
+	// 回调应逐次上报 1,2,3(递增)
+	if len(saw) != 3 {
+		t.Fatalf("期望回调被调 3 次,实际 %d 次: %v", len(saw), saw)
+	}
+	for i, n := range saw {
+		if n != i+1 {
+			t.Fatalf("期望第 %d 次回调上报 %d,实际 %d", i, i+1, n)
+		}
+	}
+	// onScan 为 nil 不应 panic
+	_ = ScanWithProgress(src, dst, nil, nil)
+}
