@@ -33,7 +33,8 @@ func parseMp4CreationTime(path string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// findBox 读取顶层 box,返回匹配 type 的 payload(仅处理 32 位 size,足够手机视频)
+// findBox 读取顶层 box,返回匹配 type 的 payload。
+// 支持 32 位 size、64 位扩展(size==1)与 size==0(延伸至文件末尾)三种边界。
 func findBox(f *os.File, want string) []byte {
 	for {
 		var hdr [8]byte
@@ -42,6 +43,16 @@ func findBox(f *os.File, want string) []byte {
 		}
 		size := binary.BigEndian.Uint32(hdr[:4])
 		typ := string(hdr[4:8])
+		if size == 0 { // box 延伸至文件末尾
+			if typ == want {
+				rest, err := io.ReadAll(f)
+				if err != nil {
+					return nil
+				}
+				return rest
+			}
+			return nil // 已到文件末尾,无更多 box
+		}
 		if size == 1 { // 64 位扩展 size
 			var ext [8]byte
 			if _, err := io.ReadFull(f, ext[:]); err != nil {
@@ -79,21 +90,23 @@ func findBox(f *os.File, want string) []byte {
 	}
 }
 
-// parseMvhd 在 moov payload 里找 mvhd,解析 creation_time
+// parseMvhd 在 moov payload 里找 mvhd,解析 creation_time。
+// 复用统一的 parseChildren 遍历,可正确处理 free/wide 等占位 box 及
+// size==0 / size==1 边界。
 func parseMvhd(moov []byte) (time.Time, bool) {
-	off := 0
-	for off+8 <= len(moov) {
-		size := int(binary.BigEndian.Uint32(moov[off : off+4]))
-		typ := string(moov[off+4 : off+8])
-		if size < 8 {
-			return time.Time{}, false
-		}
+	var t time.Time
+	var found bool
+	parseChildren(moov, func(typ string, payload []byte) bool {
 		if typ == "mvhd" {
-			return parseMvhdPayload(moov[off+8 : off+size])
+			if tt, ok := parseMvhdPayload(payload); ok {
+				t = tt
+				found = true
+				return false // 命中 mvhd,提前终止遍历
+			}
 		}
-		off += size
-	}
-	return time.Time{}, false
+		return true
+	})
+	return t, found
 }
 
 func parseMvhdPayload(p []byte) (time.Time, bool) {

@@ -144,28 +144,12 @@ func extractExifLocFromMeta(meta []byte) (exifLoc, bool) {
 	return findExtent(iloc, exifItemID)
 }
 
-// parseMetaChildren 遍历 meta body 内的子 box
+// parseMetaChildren 遍历 meta body 内的子 box,复用统一的 parseChildren 遍历。
 func parseMetaChildren(body []byte, visit func(typ string, payload []byte)) {
-	for off := 0; off+8 <= len(body); {
-		size := int(binary.BigEndian.Uint32(body[off : off+4]))
-		typ := string(body[off+4 : off+8])
-		if size == 1 {
-			if off+16 > len(body) {
-				return
-			}
-			size = int(binary.BigEndian.Uint64(body[off+8 : off+16]))
-			if size < 16 {
-				return
-			}
-		} else if size < 8 {
-			return
-		}
-		if off+size > len(body) {
-			return
-		}
-		visit(typ, body[off+8:off+size])
-		off += size
-	}
+	parseChildren(body, func(typ string, payload []byte) bool {
+		visit(typ, payload)
+		return true
+	})
 }
 
 // findExifItemID 解析 iinf,返回 item_type=="Exif" 的 item_ID。
