@@ -1,223 +1,402 @@
 package core
 
 import (
+	"bytes"
 	"encoding/binary"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
 
-// mustOpenTestFile 创建并打开测试文件
-func mustOpenTestFile(t *testing.T, path string) *os.File {
+// writeBox 写入一个 box(含头),自动选择 32 位或 64 位扩展 size。
+func writeBox(b *bytes.Buffer, typ string, payload []byte) {
+	total := 8 + len(payload)
+	if total <= 0xFFFFFFFF {
+		binary.Write(b, binary.BigEndian, uint32(total))
+		b.WriteString(typ)
+		b.Write(payload)
+	} else {
+		// 64 位扩展 size
+		binary.Write(b, binary.BigEndian, uint32(1))
+		b.WriteString(typ)
+		binary.Write(b, binary.BigEndian, uint64(16+len(payload)))
+		b.Write(payload)
+	}
+}
+
+// writeFullBox 写入 full box 形式的子 box(如 mvhd/iinf/iloc)
+func writeFullBox(b *bytes.Buffer, typ string, version byte, flags uint32, payload []byte) {
+	var body bytes.Buffer
+	body.WriteByte(version)
+	var fl [3]byte
+	fl[0] = byte(flags >> 16)
+	fl[1] = byte(flags >> 8)
+	fl[2] = byte(flags)
+	body.Write(fl[:])
+	body.Write(payload)
+	writeBox(b, typ, body.Bytes())
+}
+
+// makeMinimalMp4 生成一个最小 MP4: moov(内含 mvhd) + mdat。
+// mvhdVersion 选择 0 或 1。
+func makeMinimalMp4(t *testing.T, mvhdVersion byte) []byte {
 	t.Helper()
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatalf("创建测试文件失败: %v", err)
+	var buf bytes.Buffer
+	var moov bytes.Buffer
+
+	// mvhd full box
+	var mvhdPayload []byte
+	if mvhdVersion == 1 {
+		mvhdPayload = make([]byte, 20)
+		mvhdPayload[0] = 1 // version
+		// creation_time 8 字节: 从 mpegEpochDelta 起算
+		binary.BigEndian.PutUint64(mvhdPayload[4:12], uint64(mpegEpochDelta+1700000000))
+		// modification_time 8 字节
+		binary.BigEndian.PutUint64(mvhdPayload[12:20], uint64(mpegEpochDelta+1700000000))
+		writeBox(&moov, "mvhd", mvhdPayload)
+	} else {
+		mvhdPayload = make([]byte, 16)
+		mvhdPayload[0] = 0 // version
+		binary.BigEndian.PutUint32(mvhdPayload[4:8], uint32(mpegEpochDelta+1700000000))
+		binary.BigEndian.PutUint32(mvhdPayload[8:12], uint32(mpegEpochDelta+1700000000))
+		writeBox(&moov, "mvhd", mvhdPayload)
 	}
-	return f
+	// 再放一个大的 tkhd 模拟大文件场景(数据不真实但用于尺寸测试)
+	tkhdPayload := make([]byte, 64)
+	writeBox(&moov, "tkhd", tkhdPayload)
+
+	writeBox(&buf, "moov", moov.Bytes())
+	writeBox(&buf, "mdat", make([]byte, 32))
+	return buf.Bytes()
 }
 
-// mustWriteTestFile 从当前偏移写入内容,并重置到文件头
-func mustWriteTestFile(t *testing.T, f *os.File, data []byte) {
+// makeMinimalHeic 生成最小 HEIC: meta(内含 iinf/iloc) + mdat。
+func makeMinimalHeic(t *testing.T) []byte {
 	t.Helper()
-	if _, err := f.Seek(0, 0); err != nil {
-		t.Fatalf("seek 失败: %v", err)
-	}
-	if _, err := f.Write(data); err != nil {
-		t.Fatalf("写入测试文件失败: %v", err)
-	}
-	if _, err := f.Seek(0, 0); err != nil {
-		t.Fatalf("重置偏移失败: %v", err)
-	}
+	var buf bytes.Buffer
+	var metaBody bytes.Buffer
+
+	// meta 的 version/flags
+	metaBody.WriteByte(0)
+	metaBody.Write([]byte{0, 0, 0})
+
+	// iinf full box
+	var iinfBody bytes.Buffer
+	iinfBody.WriteByte(0) // version
+	iinfBody.Write([]byte{0, 0, 0})
+	binary.Write(&iinfBody, binary.BigEndian, uint16(1)) // entry_count=1
+	// infe full box: version=2
+	var infeBody bytes.Buffer
+	infeBody.WriteByte(2) // version
+	infeBody.Write([]byte{0, 0, 0})
+	binary.Write(&infeBody, binary.BigEndian, uint16(1)) // item_ID=1
+	binary.Write(&infeBody, binary.BigEndian, uint16(0)) // protection_index
+	binary.Write(&infeBody, binary.BigEndian, uint16(0)) // reserved
+	binary.Write(&infeBody, binary.BigEndian, uint16(0)) // flags
+	infeBody.WriteString("Exif")                         // item_type
+	infeBody.WriteString("")                             // item_name(空)
+	writeBox(&iinfBody, "infe", infeBody.Bytes())
+	writeBox(&metaBody, "iinf", iinfBody.Bytes())
+
+	// iloc full box: version=0
+	var ilocBody bytes.Buffer
+	ilocBody.WriteByte(0) // version
+	ilocBody.Write([]byte{0, 0, 0})
+	// offset_size=4, length_size=4, base_offset_size=0, index_size=0
+	ilocBody.WriteByte(0x44)                              // offset_size=4, length_size=4
+	ilocBody.WriteByte(0x00)                              // base_offset_size=0, index_size=0
+	binary.Write(&ilocBody, binary.BigEndian, uint16(1))  // item_count=1
+	binary.Write(&ilocBody, binary.BigEndian, uint16(1))  // item_ID=1
+	binary.Write(&ilocBody, binary.BigEndian, uint16(0))  // data_reference_index
+	binary.Write(&ilocBody, binary.BigEndian, uint16(1))  // extent_count=1
+	binary.Write(&ilocBody, binary.BigEndian, uint32(0))  // extent_offset=0
+	binary.Write(&ilocBody, binary.BigEndian, uint32(64)) // extent_length=64
+	writeBox(&metaBody, "iloc", ilocBody.Bytes())
+
+	writeBox(&buf, "meta", metaBody.Bytes())
+
+	// mdat 数据区(64 字节)
+	// EXIF 数据块: 前 4 字节 = tiff 偏移(4), 后跟 TIFF
+	mdat := make([]byte, 64)
+	binary.BigEndian.PutUint32(mdat[:4], 4)
+	// 简单 TIFF: little-endian, IFD0 空
+	tiff := mdat[4:]
+	tiff[0] = 'I'
+	tiff[1] = 'I'
+	binary.LittleEndian.PutUint16(tiff[2:4], 42)
+	binary.LittleEndian.PutUint32(tiff[4:8], 8)  // IFD0 在 offset 8
+	binary.LittleEndian.PutUint16(tiff[8:10], 0) // IFD0 entry count=0
+	writeBox(&buf, "mdat", mdat)
+
+	return buf.Bytes()
 }
 
-// bigBox 构造一个 size+type 的 box 头
-func testBox(typ string, payload []byte) []byte {
-	b := make([]byte, 8+len(payload))
-	binary.BigEndian.PutUint32(b[:4], uint32(8+len(payload)))
-	copy(b[4:8], typ)
-	copy(b[8:], payload)
-	return b
-}
-
-// TestParseChildren_FreeWide 验证 free/wide/skip 占位 box 被安全跳过,
-// 不干扰后续目标 box 的解析。
-func TestParseChildren_FreeWide(t *testing.T) {
-	var data []byte
-	data = append(data, testBox("free", nil)...)
-	data = append(data, testBox("wide", nil)...)
-	data = append(data, testBox("skip", nil)...)
-	data = append(data, testBox("mvhd", make([]byte, 12))...)
-
-	var got []string
-	parseChildren(data, func(typ string, _ []byte) bool {
-		got = append(got, typ)
-		return true
-	})
-	want := []string{"free", "wide", "skip", "mvhd"}
-	if len(got) != len(want) {
-		t.Fatalf("遍历 box 数量 = %d,期望 %d;got=%v", len(got), len(want), got)
+func writeTempFile(t *testing.T, data []byte) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "test.bin")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatalf("写入临时文件失败: %v", err)
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("第 %d 个 box = %q,期望 %q", i, got[i], want[i])
-		}
-	}
-}
-
-// TestParseChildren_SizeZero 验证 size==0 时 box 延伸至末尾,payload 为剩余数据。
-func TestParseChildren_SizeZero(t *testing.T) {
-	// 构造: 一个普通 box + 一个 size==0 的占位 box(整段剩余)
-	var data []byte
-	data = append(data, testBox("ftyp", []byte("isom"))...)
-	// size==0 box: 头 8 字节,size 字段为 0,type 为 "mdat"
-	tail := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 1, 2, 3}
-	sizeZero := make([]byte, 8+len(tail))
-	binary.BigEndian.PutUint32(sizeZero[:4], 0) // size==0
-	copy(sizeZero[4:8], "mdat")
-	copy(sizeZero[8:], tail)
-	data = append(data, sizeZero...)
-
-	var mdatPayload []byte
-	var sawMdat bool
-	parseChildren(data, func(typ string, payload []byte) bool {
-		if typ == "mdat" {
-			sawMdat = true
-			mdatPayload = append([]byte(nil), payload...)
-		}
-		return true
-	})
-	if !sawMdat {
-		t.Fatal("未遍历到 size==0 的 mdat box")
-	}
-	if string(mdatPayload) != string(tail) {
-		t.Errorf("size==0 payload = %v,期望 %v", mdatPayload, tail)
-	}
-}
-
-// TestParseChildren_SizeOne 验证 size==1 时 64 位扩展大小被正确解析。
-func TestParseChildren_SizeOne(t *testing.T) {
-	// 构造一个 size==1 的 box,64 位大小 = 16 + payload
-	payload := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
-	box := make([]byte, 16+len(payload))
-	binary.BigEndian.PutUint32(box[:4], 1) // size==1 标记
-	copy(box[4:8], "uuid")
-	binary.BigEndian.PutUint64(box[8:16], uint64(16+len(payload)))
-	copy(box[16:], payload)
-
-	var gotPayload []byte
-	var saw bool
-	parseChildren(box, func(typ string, p []byte) bool {
-		if typ == "uuid" {
-			saw = true
-			gotPayload = append([]byte(nil), p...)
-		}
-		return true
-	})
-	if !saw {
-		t.Fatal("未遍历到 size==1 的 uuid box")
-	}
-	if string(gotPayload) != string(payload) {
-		t.Errorf("size==1 payload = %v,期望 %v", gotPayload, payload)
-	}
-}
-
-// TestParseChildren_VisitStop 验证 visit 返回 false 可提前终止遍历。
-func TestParseChildren_VisitStop(t *testing.T) {
-	var data []byte
-	data = append(data, testBox("free", nil)...)
-	data = append(data, testBox("mvhd", make([]byte, 12))...)
-	data = append(data, testBox("skip", nil)...)
-
-	var got []string
-	parseChildren(data, func(typ string, _ []byte) bool {
-		got = append(got, typ)
-		return typ != "mvhd" // 遇到 mvhd 后停止
-	})
-	want := []string{"free", "mvhd"}
-	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-		t.Errorf("提前终止遍历结果 = %v,期望 %v", got, want)
-	}
-}
-
-// mvhd 构造一个 mvhd payload(version 0),creation_time 由 secs 指定。
-func testMvhdPayload(secs uint32) []byte {
-	p := make([]byte, 20)
-	p[0] = 0 // version
-	binary.BigEndian.PutUint32(p[4:8], secs)
 	return p
 }
 
-// TestParseMvhd_WithPlaceholders 验证 moov 内含 free/wide 占位 box、
-// size==0 与 size==1 边界时,parseMvhd 仍能正确定位并解析 mvhd。
-func TestParseMvhd_WithPlaceholders(t *testing.T) {
-	var moov []byte
-	moov = append(moov, testBox("free", nil)...)              // 普通占位
-	moov = append(moov, testBox("wide", []byte{0, 0, 0, 0})...) // 带负载占位
+// TestReadBoxHeader32Bit 验证 32 位 size 的 box 头解析
+func TestReadBoxHeader32Bit(t *testing.T) {
+	var buf bytes.Buffer
+	payload := make([]byte, 24)
+	writeBox(&buf, "ftyp", payload)
 
-	secs := uint32(3000000000)
-	mvhdPayload := testMvhdPayload(secs)
-
-	// mvhd 使用 size==1(64 位扩展)形式
-	mvhd := make([]byte, 16+len(mvhdPayload))
-	binary.BigEndian.PutUint32(mvhd[:4], 1)
-	copy(mvhd[4:8], "mvhd")
-	binary.BigEndian.PutUint64(mvhd[8:16], uint64(16+len(mvhdPayload)))
-	copy(mvhd[16:], mvhdPayload)
-	moov = append(moov, mvhd...)
-
-	// 末尾一个 size==0 的占位 box
-	sizeZero := make([]byte, 8)
-	binary.BigEndian.PutUint32(sizeZero[:4], 0)
-	copy(sizeZero[4:8], "free")
-	moov = append(moov, sizeZero...)
-
-	tm, ok := parseMvhd(moov)
-	if !ok {
-		t.Fatal("parseMvhd 未能解析含占位/边界 box 的 moov")
+	f, err := os.Open(writeTempFile(t, buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
 	}
-	want := time.Unix(int64(secs)-mpegEpochDelta, 0)
-	if tm.Unix() != want.Unix() {
-		t.Errorf("parseMvhd 时间 = %v,期望 %v", tm, want)
-	}
-}
-
-// TestParseMvhd_NoMvhd 验证不含 mvhd 时返回 false,且不因 size==0 死循环。
-func TestParseMvhd_NoMvhd(t *testing.T) {
-	var moov []byte
-	moov = append(moov, testBox("free", nil)...)
-	// size==0 的占位 box
-	sizeZero := make([]byte, 8)
-	binary.BigEndian.PutUint32(sizeZero[:4], 0)
-	copy(sizeZero[4:8], "skip")
-	moov = append(moov, sizeZero...)
-
-	if _, ok := parseMvhd(moov); ok {
-		t.Fatal("不含 mvhd 时不应返回 ok=true")
-	}
-}
-
-// TestFindBox_SizeZero 验证 findBox 对 size==0 的顶层 box 读取到文件末尾。
-func TestFindBox_SizeZero(t *testing.T) {
-	path := t.TempDir() + "/s0.mp4"
-	f := mustOpenTestFile(t, path)
 	defer f.Close()
 
-	// 构造: ftyp + moov(内含 mvhd box) + size==0 的 mdat 延伸到末尾
-	moovPayload := testBox("mvhd", testMvhdPayload(3000000000))
-	content := append(testBox("ftyp", []byte("isom")), testBox("moov", moovPayload)...)
-	mdat := make([]byte, 8)
-	binary.BigEndian.PutUint32(mdat[:4], 0)
-	copy(mdat[4:8], "mdat")
-	content = append(content, mdat...)
-	mustWriteTestFile(t, f, content)
-
-	// 定位 moov(普通路径)
-	moov := findBox(f, "moov")
-	if moov == nil {
-		t.Fatal("findBox 未找到 moov")
+	bh, ok := readBoxHeader(f)
+	if !ok {
+		t.Fatal("readBoxHeader 失败")
 	}
-	if tm, ok := parseMvhd(moov); !ok || tm.IsZero() {
-		t.Fatal("moov 内解析 mvhd 失败")
+	if bh.typ != "ftyp" {
+		t.Errorf("typ = %q,期望 ftyp", bh.typ)
+	}
+	if bh.boxSize != 32 {
+		t.Errorf("boxSize = %d,期望 32", bh.boxSize)
+	}
+	if bh.hdrSize != 8 {
+		t.Errorf("hdrSize = %d,期望 8", bh.hdrSize)
+	}
+	if bh.dataOff != 8 {
+		t.Errorf("dataOff = %d,期望 8", bh.dataOff)
+	}
+}
+
+// TestReadBoxHeader64Bit 验证 64 位扩展 size 的 box 头解析
+func TestReadBoxHeader64Bit(t *testing.T) {
+	var buf bytes.Buffer
+	// 手动构造 64 位扩展 box
+	binary.Write(&buf, binary.BigEndian, uint32(1)) // size==1 表示 64 位扩展
+	buf.WriteString("moov")
+	binary.Write(&buf, binary.BigEndian, uint64(16+100)) // 16 头 + 100 负载
+	buf.Write(make([]byte, 100))
+
+	f, err := os.Open(writeTempFile(t, buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	bh, ok := readBoxHeader(f)
+	if !ok {
+		t.Fatal("readBoxHeader 失败")
+	}
+	if bh.typ != "moov" {
+		t.Errorf("typ = %q,期望 moov", bh.typ)
+	}
+	if bh.boxSize != 116 {
+		t.Errorf("boxSize = %d,期望 116", bh.boxSize)
+	}
+	if bh.hdrSize != 16 {
+		t.Errorf("hdrSize = %d,期望 16", bh.hdrSize)
+	}
+	if bh.dataOff != 16 {
+		t.Errorf("dataOff = %d,期望 16", bh.dataOff)
+	}
+}
+
+// TestReadBoxHeaderSizeZero 验证 size==0 时 box 延伸至文件末尾。
+func TestReadBoxHeaderSizeZero(t *testing.T) {
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.BigEndian, uint32(0)) // size==0
+	buf.WriteString("mdat")
+	buf.Write(make([]byte, 100)) // mdat 负载,box 一直延伸到文件末尾
+
+	f, err := os.Open(writeTempFile(t, buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	bh, ok := readBoxHeader(f)
+	if !ok {
+		t.Fatal("readBoxHeader(size==0) 失败")
+	}
+	if bh.typ != "mdat" {
+		t.Errorf("typ = %q,期望 mdat", bh.typ)
+	}
+	// 文件总长 = 8(头) + 100(负载) = 108,dataOff = 8
+	// box 延伸至末尾,boxSize = 108 - 8 = 100
+	if bh.boxSize != 100 {
+		t.Errorf("boxSize = %d,期望 100", bh.boxSize)
+	}
+	if bh.hdrSize != 8 {
+		t.Errorf("hdrSize = %d,期望 8", bh.hdrSize)
+	}
+}
+
+// TestReadBoxHeaderInvalidSize 验证 size 边界(32 位 size<8,64 位 size<16)
+func TestReadBoxHeaderInvalidSize(t *testing.T) {
+	// size = 1(64 位),但 sz64 < 16
+	{
+		var buf bytes.Buffer
+		binary.Write(&buf, binary.BigEndian, uint32(1))
+		buf.WriteString("free")
+		binary.Write(&buf, binary.BigEndian, uint64(8)) // < 16
+		f, _ := os.Open(writeTempFile(t, buf.Bytes()))
+		defer f.Close()
+		if _, ok := readBoxHeader(f); ok {
+			t.Error("size64<16 应返回 false")
+		}
+	}
+	// size = 4(32 位,但 < 8)
+	{
+		var buf bytes.Buffer
+		binary.Write(&buf, binary.BigEndian, uint32(4))
+		buf.WriteString("free")
+		f, _ := os.Open(writeTempFile(t, buf.Bytes()))
+		defer f.Close()
+		if _, ok := readBoxHeader(f); ok {
+			t.Error("size<8 应返回 false")
+		}
+	}
+}
+
+// TestParseMp4CreationTime 验证按需 seek 解析 MP4 创建时间
+func TestParseMp4CreationTime(t *testing.T) {
+	for _, ver := range []byte{0, 1} {
+		data := makeMinimalMp4(t, ver)
+		p := writeTempFile(t, data)
+		tm, ok := parseMp4CreationTime(p)
+		if !ok {
+			t.Fatalf("version %d: parseMp4CreationTime 失败", ver)
+		}
+		want := time.Unix(1700000000, 0).Local()
+		if !tm.Equal(want) {
+			t.Errorf("version %d: got %v, want %v", ver, tm, want)
+		}
+	}
+}
+
+// TestParseMp4NoMoov 验证无 moov 的 MP4 返回失败
+func TestParseMp4NoMoov(t *testing.T) {
+	var buf bytes.Buffer
+	writeBox(&buf, "ftyp", make([]byte, 8))
+	writeBox(&buf, "mdat", make([]byte, 8))
+	p := writeTempFile(t, buf.Bytes())
+	if _, ok := parseMp4CreationTime(p); ok {
+		t.Error("无 moov 应返回 false")
+	}
+}
+
+// TestParseHeifExifTime 验证按需 seek 解析 HEIF EXIF 时间
+func TestParseHeifExifTime(t *testing.T) {
+	data := makeMinimalHeic(t)
+	p := writeTempFile(t, data)
+	// 目前最小 HEIC 中 TIFF 不含 DateTimeOriginal,返回 false 是预期
+	// 但流程应正常执行不 panic。
+	parseHeifExifTime(p)
+	// 主要验证不 panic 且内部逻辑可运行;具体日期解析已在 exif.go 中覆盖
+}
+
+// TestFindMetaInfo 验证在 meta 内按需定位 iinf/iloc
+func TestFindMetaInfo(t *testing.T) {
+	data := makeMinimalHeic(t)
+	p := writeTempFile(t, data)
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// 遍历顶层找到 meta
+	for {
+		bh, ok := readBoxHeader(f)
+		if !ok {
+			break
+		}
+		if bh.typ == "meta" {
+			id, iloc, ok := findMetaInfo(f, bh)
+			if !ok {
+				t.Fatal("findMetaInfo 失败")
+			}
+			if id != 1 {
+				t.Errorf("itemID = %d,期望 1", id)
+			}
+			if len(iloc) == 0 {
+				t.Error("iloc 为空")
+			}
+			// 验证 findExtent
+			loc, ok := findExtent(iloc, id)
+			if !ok {
+				t.Error("findExtent 失败")
+			}
+			if loc.offset != 0 || loc.length != 64 {
+				t.Errorf("extent = (%d,%d),期望 (0,64)", loc.offset, loc.length)
+			}
+			return
+		}
+		if !skipToNextBox(f, bh) {
+			break
+		}
+	}
+	t.Fatal("未找到 meta box")
+}
+
+// TestSkipToNextBox 验证 skipToNextBox 正确跳过 box 负载
+func TestSkipToNextBox(t *testing.T) {
+	var buf bytes.Buffer
+	writeBox(&buf, "moov", make([]byte, 100))
+	writeBox(&buf, "mdat", make([]byte, 50))
+	writeBox(&buf, "free", make([]byte, 10))
+
+	p := writeTempFile(t, buf.Bytes())
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// 跳过 moov
+	bh, ok := readBoxHeader(f)
+	if !ok || bh.typ != "moov" {
+		t.Fatal("读取 moov 头失败")
+	}
+	if !skipToNextBox(f, bh) {
+		t.Fatal("skipToNextBox 失败")
+	}
+	// 下一个应该是 mdat
+	bh2, ok := readBoxHeader(f)
+	if !ok || bh2.typ != "mdat" {
+		t.Fatalf("跳过 moov 后应读到 mdat,got %q", bh2.typ)
+	}
+	if !skipToNextBox(f, bh2) {
+		t.Fatal("skipToNextBox 失败")
+	}
+	// 下一个应该是 free
+	bh3, ok := readBoxHeader(f)
+	if !ok || bh3.typ != "free" {
+		t.Fatalf("跳过 mdat 后应读到 free,got %q", bh3.typ)
+	}
+}
+
+// TestReadBoxPayload 验证读取 box 负载
+func TestReadBoxPayload(t *testing.T) {
+	var buf bytes.Buffer
+	payload := []byte("hello-world-payload")
+	writeBox(&buf, "test", payload)
+
+	f, _ := os.Open(writeTempFile(t, buf.Bytes()))
+	defer f.Close()
+
+	bh, ok := readBoxHeader(f)
+	if !ok {
+		t.Fatal("readBoxHeader 失败")
+	}
+	got, ok := readBoxPayload(f, bh)
+	if !ok {
+		t.Fatal("readBoxPayload 失败")
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("payload = %q,期望 %q", got, payload)
 	}
 }

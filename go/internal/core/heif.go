@@ -5,10 +5,12 @@
 //	-> EXIF 数据块前 4 字节为大端 exif_tiff_header_offset,其后是 TIFF -> 复用 parseTiffDateTime
 //
 // 覆盖 HEIC/HEIF(JPEG EXIF 在 APP1 段,结构不同,走 exif.go)。
+// 内存策略: 全程流式 I/O,不整段读入 meta 负载;仅按需读取 iinf/iloc 等目标 box。
 package core
 
 import (
 	"encoding/binary"
+	"io"
 	"os"
 	"time"
 )
@@ -39,48 +41,49 @@ func heifExifStatus(path string) heifStatus {
 	}
 	defer f.Close()
 
-	var meta []byte
 	var mdatDataStart int64 = -1
-	// 顶层 box 遍历;对 meta 读取内容,对其它 box(尤其 mdat)只记录数据起点并 seek 跳过
+	var exifItemID = -1
+	var iloc []byte
+	// 顶层 box 遍历
 	for {
-		typ, dataStart, boxSize, ok := peekTopBox(f)
+		bh, ok := readBoxHeader(f)
 		if !ok {
 			break
 		}
-		if typ == "mdat" && mdatDataStart < 0 {
-			mdatDataStart = dataStart
-		}
-		if typ == "meta" {
-			// 读取 meta 负载(version/flags + 子 box)
-			payload := make([]byte, boxSize-8)
-			if _, err := f.Read(payload); err != nil {
-				return heifStatus{ok: false, kind: heifParseFailed, desc: "HEIC 解析失败(meta 读取异常)"}
+		switch bh.typ {
+		case "mdat":
+			if mdatDataStart < 0 {
+				mdatDataStart = bh.dataOff
 			}
-			meta = payload
-			continue
+		case "meta":
+			// meta 是 full box(4 字节 version/flags),其后才是子 box。
+			// 按需遍历 meta 子 box,仅读取 iinf/iloc 的负载。
+			if id, ilocData, ok2 := findMetaInfo(f, bh); ok2 {
+				exifItemID = id
+				iloc = ilocData
+			}
 		}
-		// 跳到下一个 box:已读过 8 字节头,需跳过剩余 boxSize-8 字节
-		if _, err := f.Seek(int64(boxSize-8), 1); err != nil {
-			return heifStatus{ok: false, kind: heifParseFailed, desc: "HEIC 解析失败(容器读取异常)"}
+		if !skipToNextBox(f, bh) {
+			break
 		}
 	}
 
-	if len(meta) == 0 || mdatDataStart < 0 {
-		// 无 meta 或 mdat,视为该 HEIC 确实不含 Exif
-		return heifStatus{ok: false, kind: heifNoExif, desc: "HEIC 无 Exif 数据(无 meta/mdat)"}
+	if exifItemID < 0 || len(iloc) == 0 || mdatDataStart < 0 {
+		// 无 Exif item / 无 iloc / 无 mdat,视为该 HEIC 确实不含 Exif
+		return heifStatus{ok: false, kind: heifNoExif, desc: "HEIC 无 Exif 数据(无 Exif item/iloc/mdat)"}
 	}
 
-	loc, ok := extractExifLocFromMeta(meta)
+	loc, ok := findExtent(iloc, exifItemID)
 	if !ok {
 		// 找不到 Exif item,说明文件正常但无 Exif 元数据
 		return heifStatus{ok: false, kind: heifNoExif, desc: "HEIC 无 Exif 数据(未找到 Exif item)"}
 	}
 	// 从 mdat 按偏移读取 EXIF 数据块
-	if _, err := f.Seek(mdatDataStart+loc.offset, 0); err != nil {
+	if _, err := f.Seek(mdatDataStart+loc.offset, io.SeekStart); err != nil {
 		return heifStatus{ok: false, kind: heifParseFailed, desc: "HEIC 解析失败(数据偏移定位异常)"}
 	}
 	buf := make([]byte, loc.length)
-	if _, err := f.Read(buf); err != nil {
+	if _, err := io.ReadFull(f, buf); err != nil {
 		return heifStatus{ok: false, kind: heifParseFailed, desc: "HEIC 解析失败(Exif 数据读取不完整)"}
 	}
 	// EXIF 数据块: 前 4 字节 = exif_tiff_header_offset(大端),其后为 TIFF 数据
@@ -112,44 +115,70 @@ func parseHeifExifTime(path string) (time.Time, bool) {
 	return st.t, st.ok
 }
 
+// findMetaInfo 在 meta box 内按需遍历子 box。
+// meta 是 full box(跳过 4 字节 version/flags 后的 body 才是子 box)。
+// 仅读取 iinf/iloc 的负载并解析,返回 Exif 条目 item_ID 与 iloc payload。
+// 其它子 box 仅 seek 跳过,不读入内存。
+func findMetaInfo(f *os.File, meta boxHeader) (exifItemID int, iloc []byte, ok bool) {
+	// 无论成功失败,退出时都恢复文件偏移到 meta 数据区起点
+	defer f.Seek(meta.dataOff, io.SeekStart)
+
+	// meta 数据区起点,前 4 字节为 version/flags(full box)
+	bodyStart := meta.dataOff + 4
+	bodyEnd := meta.dataOff + (meta.boxSize - meta.hdrSize)
+	if bodyStart+8 > bodyEnd {
+		return -1, nil, false
+	}
+
+	exifItemID = -1
+	off := bodyStart
+	for off+8 <= bodyEnd {
+		if _, err := f.Seek(off, io.SeekStart); err != nil {
+			return -1, nil, false
+		}
+		child, ok2 := readBoxHeader(f)
+		if !ok2 {
+			return -1, nil, false
+		}
+		if off+child.boxSize > bodyEnd {
+			return -1, nil, false // 子 box 超出 meta 范围
+		}
+		switch child.typ {
+		case "iinf":
+			// 读取 iinf 负载,解析 Exif item_ID
+			payload, ok3 := readBoxPayload(f, child)
+			if !ok3 {
+				return -1, nil, false
+			}
+			if id, found := findExifItemID(payload); found {
+				exifItemID = id
+			}
+		case "iloc":
+			// 读取 iloc 负载
+			payload, ok3 := readBoxPayload(f, child)
+			if !ok3 {
+				return -1, nil, false
+			}
+			iloc = payload
+		}
+		// 绝对定位到下一个子 box 头部。
+		// 注意:对已调用 readBoxPayload 的 box,文件偏移已位于 box 末尾,
+		// 此处用绝对 seek 覆盖,避免相对 skip 造成偏移双倍前进。
+		if _, err := f.Seek(off+child.boxSize, io.SeekStart); err != nil {
+			return -1, nil, false
+		}
+		off += child.boxSize
+	}
+	if exifItemID < 0 || len(iloc) == 0 {
+		return -1, nil, false
+	}
+	return exifItemID, iloc, true
+}
+
 // exifLoc 描述 EXIF 数据块在 mdat 数据区中的偏移和长度
 type exifLoc struct {
 	offset int64
 	length int64
-}
-
-// extractExifLocFromMeta 在 meta 内解析 iinf/iloc,定位 Exif 条目的数据位置。
-// meta 是 full box,跳过 4 字节 version/flags 后的 body 才是子 box。
-func extractExifLocFromMeta(meta []byte) (exifLoc, bool) {
-	if len(meta) < 4 {
-		return exifLoc{}, false
-	}
-	body := meta[4:]
-
-	exifItemID := -1
-	var iloc []byte
-	parseMetaChildren(body, func(typ string, payload []byte) {
-		switch typ {
-		case "iinf":
-			if id, ok := findExifItemID(payload); ok {
-				exifItemID = id
-			}
-		case "iloc":
-			iloc = payload
-		}
-	})
-	if exifItemID < 0 || len(iloc) == 0 {
-		return exifLoc{}, false
-	}
-	return findExtent(iloc, exifItemID)
-}
-
-// parseMetaChildren 遍历 meta body 内的子 box,复用统一的 parseChildren 遍历。
-func parseMetaChildren(body []byte, visit func(typ string, payload []byte)) {
-	parseChildren(body, func(typ string, payload []byte) bool {
-		visit(typ, payload)
-		return true
-	})
 }
 
 // findExifItemID 解析 iinf,返回 item_type=="Exif" 的 item_ID。
@@ -334,33 +363,4 @@ func readUint(b []byte) int64 {
 		v = v<<8 | int64(c)
 	}
 	return v
-}
-
-// peekTopBox 从当前文件偏移读取一个顶层 box 的头,返回其类型、
-// 数据区起始偏移(dataStart,即跳过 header 后)和 box 总大小(boxSize,含头)。
-// 不读取负载数据,由调用方决定读取或跳过。
-func peekTopBox(f *os.File) (typ string, dataStart int64, boxSize int64, ok bool) {
-	var hdr [8]byte
-	if _, err := f.Read(hdr[:]); err != nil {
-		return "", 0, 0, false
-	}
-	size := binary.BigEndian.Uint32(hdr[:4])
-	typ = string(hdr[4:8])
-	if size == 1 {
-		var ext [8]byte
-		if _, err := f.Read(ext[:]); err != nil {
-			return "", 0, 0, false
-		}
-		sz64 := binary.BigEndian.Uint64(ext[:])
-		if sz64 < 16 {
-			return "", 0, 0, false
-		}
-		pos, _ := f.Seek(0, 1) // 当前偏移 = 16 字节头结束
-		return typ, pos, int64(sz64), true
-	}
-	if size < 8 {
-		return "", 0, 0, false
-	}
-	pos, _ := f.Seek(0, 1) // 当前偏移 = 8 字节头结束
-	return typ, pos, int64(size), true
 }
