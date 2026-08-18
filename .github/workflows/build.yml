@@ -1,0 +1,97 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            ext: .exe
+            sha: sha256sum
+          - os: macos-latest
+            ext: ""
+            sha: shasum -a 256
+          - os: ubuntu-latest
+            ext: ""
+            sha: sha256sum
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: false
+
+      # fyne GUI 需要 gcc/cgo:
+      # - macOS/Ubuntu 自带 clang/gcc,但需补齐 X11/Wayland 图形开发库
+      # - Windows 需要 MinGW-w64(MSYS2)
+      - name: Install GUI deps (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+
+      - name: Install GUI deps (Windows, MSYS2/MinGW-w64)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: mingw64
+          install: mingw-w64-x86_64-gcc
+
+      - name: Build CLI (Go)
+        working-directory: go
+        run: go build -trimpath -o mediasort${{ matrix.ext }} ./cmd/mediasort
+
+      - name: Build GUI (fyne, non-Windows)
+        if: runner.os != 'Windows'
+        working-directory: go
+        run: go build -trimpath -tags fyne -o mediasort-gui${{ matrix.ext }} ./cmd/mediasort-gui
+
+      - name: Build GUI (fyne, Windows native shell + MinGW PATH)
+        # MinGW gcc 装在 C:\msys64\mingw64\bin;原生 shell 编译。
+        # -linkmode external -extldflags "-static" 静态链接 MinGW 运行时,产出的 exe 免装依赖。
+        if: runner.os == 'Windows'
+        working-directory: go
+        shell: powershell
+        run: |
+          $env:Path = "C:\msys64\mingw64\bin;" + $env:Path
+          gcc --version
+          go build -trimpath -tags fyne -ldflags "-H windowsgui -linkmode external -extldflags -static" -o mediasort-gui${{ matrix.ext }} ./cmd/mediasort-gui
+
+      - name: Checksum (CLI)
+        shell: bash
+        run: ${{ matrix.sha }} go/mediasort${{ matrix.ext }} > go/mediasort${{ matrix.ext }}.sha256
+
+      - name: Checksum (GUI)
+        shell: bash
+        run: ${{ matrix.sha }} go/mediasort-gui${{ matrix.ext }} > go/mediasort-gui${{ matrix.ext }}.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mediasort-${{ runner.os }}
+          path: |
+            go/mediasort${{ matrix.ext }}
+            go/mediasort${{ matrix.ext }}.sha256
+            go/mediasort-gui${{ matrix.ext }}
+            go/mediasort-gui${{ matrix.ext }}.sha256
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            go/mediasort${{ matrix.ext }}
+            go/mediasort${{ matrix.ext }}.sha256
+            go/mediasort-gui${{ matrix.ext }}
+            go/mediasort-gui${{ matrix.ext }}.sha256

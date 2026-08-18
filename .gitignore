@@ -1,0 +1,15 @@
+# Build artifacts
+*.exe
+*.pdb
+dist/
+build/
+build_tmp*/
+__pycache__/
+*.pyc
+
+# Runtime output (sorted photos go here)
+照片整理/
+
+# OS
+.DS_Store
+Thumbs.db
