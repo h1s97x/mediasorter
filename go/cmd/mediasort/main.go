@@ -1,7 +1,7 @@
 // MediaSorterGo - 按拍摄时间整理照片/视频(CLI + Windows 拖放)
 // 用法:
 //
-//	把照片文件夹拖到 exe 图标上,松手即可(结果生成在 exe 旁『照片整理』)
+//	把照片文件夹拖到 exe 图标上,松手即可(结果生成在源文件夹同级『MediaSorter』)
 //	或命令行: mediasort <源文件夹> [目标文件夹]
 //
 // 选项(可选,用 -- 开头):
@@ -73,8 +73,8 @@ func main() {
 	if len(positional) >= 2 {
 		opt.Dst = positional[1]
 	} else {
-		exe, _ := os.Executable()
-		opt.Dst = filepath.Join(filepath.Dir(exe), "照片整理")
+		// 留空: 默认输出到源文件夹的父目录下『MediaSorter』,与源文件夹同级
+		opt.Dst = filepath.Join(filepath.Dir(opt.Src), "MediaSorter")
 	}
 
 	fmt.Printf("输入文件夹: %s\n", opt.Src)
@@ -108,7 +108,7 @@ func printHelp() {
 	fmt.Println("MediaSorterGo - 按拍摄时间整理照片/视频")
 	fmt.Println("=" + strings.Repeat("=", 52))
 	fmt.Println("用法一(最简单): 把照片文件夹拖到本程序图标上,松手")
-	fmt.Println("  结果生成在本程序旁边的『照片整理』文件夹,按 年/月 排好")
+	fmt.Println("  结果生成在源文件夹的上一级目录『MediaSorter』,按 年/月 排好")
 	fmt.Println("用法二(命令行): mediasort <源文件夹> [目标文件夹] [选项]")
 	fmt.Println("  选项: --move | --no-dedupe | --dry-run | --offset=秒 | --year | --day | --jobs=并发数")
 }

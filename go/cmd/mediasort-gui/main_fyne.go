@@ -33,7 +33,7 @@ func main() {
 	srcEntry := widget.NewEntry()
 	srcEntry.SetPlaceHolder("手机导出的照片文件夹(可整个 U 盘,也可直接拖放到窗口)")
 	dstEntry := widget.NewEntry()
-	dstEntry.SetPlaceHolder("目标文件夹(留空 = 程序旁『照片整理』)")
+	dstEntry.SetPlaceHolder("目标文件夹(留空 = 源文件夹上一级『MediaSorter』)")
 
 	mode := "ym"
 	modeGroup := widget.NewRadioGroup([]string{"年/月", "仅年", "年/月/日"}, func(s string) {
@@ -221,8 +221,8 @@ func main() {
 		}
 		dst := dstEntry.Text
 		if dst == "" {
-			exe, _ := os.Executable()
-			dst = filepath.Join(filepath.Dir(exe), "照片整理")
+			// 留空: 默认输出到源文件夹的父目录下『MediaSorter』,与源文件夹同级
+			dst = filepath.Join(filepath.Dir(src), "MediaSorter")
 		}
 		offset := 0
 		if v, err := strconv.Atoi(offsetEntry.Text); err == nil {

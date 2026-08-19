@@ -4,6 +4,7 @@ package core
 import (
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -339,7 +340,23 @@ func Run(opt Options, log func(string)) Result {
 			}
 			var err error
 			if opt.Move {
+				// 优先同盘重命名;跨磁盘时 os.Rename 会失败,降级为复制+删除源文件
 				err = os.Rename(f, target)
+				if err != nil {
+					if cerr := copyFile(f, target, ctx); cerr == nil {
+						// 删除源文件是破坏性操作,先校验目标与源大小一致,防止复制不完整导致照片永久丢失
+						si, _ := os.Stat(f)
+						ti, _ := os.Stat(target)
+						if si != nil && ti != nil && si.Size() == ti.Size() {
+							err = os.Remove(f)
+						} else {
+							os.Remove(target) // 复制不完整,清理半成品,保留源文件
+							err = errors.New("复制不完整,已保留源文件")
+						}
+					} else {
+						err = cerr
+					}
+				}
 			} else {
 				err = copyFile(f, target, ctx)
 			}
@@ -410,7 +427,8 @@ drain:
 }
 
 // copyFile 流式复制,大文件不占内存。复制过程中检查 ctx 取消:若取消,
-// 删除已写出的半成品文件并返回取消错误,保证不产生脏数据。
+// 返回取消错误。任何出错路径(写失败/读失败/取消)都通过 defer 统一
+// 关闭句柄并删除半成品,保证不残留不完整的脏数据。
 func copyFile(src, dst string, ctx context.Context) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -421,13 +439,18 @@ func copyFile(src, dst string, ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	ok := false
+	defer func() {
+		if !ok {
+			// 出错或取消: 关闭句柄并删除半成品,避免残留脏文件
+			out.Close()
+			os.Remove(dst)
+		}
+	}()
 	// 64KB 分块复制,便于在复制过程中检查取消信号。
 	buf := make([]byte, 64*1024)
 	for {
 		if ctx.Err() != nil {
-			// 取消: 删除半成品,返回取消错误,由调用方统一处理。
-			out.Close()
-			os.Remove(dst)
 			return ctx.Err()
 		}
 		n, rerr := in.Read(buf)
@@ -443,7 +466,11 @@ func copyFile(src, dst string, ctx context.Context) error {
 			return rerr
 		}
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
 func relDir(t time.Time, opt Options) string {
