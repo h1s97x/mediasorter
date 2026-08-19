@@ -339,6 +339,7 @@ func main() {
 		go func() {
 			res := core.Run(opt, func(s string) { ch <- s })
 			doneCh <- res
+			close(ch) // 关闭日志通道,让消费者循环退出,从而恢复按钮并输出最终状态
 		}()
 
 		go func() {
