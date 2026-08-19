@@ -50,7 +50,10 @@ func main() {
 	})
 	modeGroup.SetSelected("年/月")
 
-	moveChk := widget.NewCheck("移动文件(默认只复制,源文件不动)", nil)
+	// 危险操作归入『高级选项』折叠区,默认展开(false)。
+	// 移动文件会删除源文件,属破坏性操作,故不放主界面、也不默认勾选。
+	moveChk := widget.NewCheck("移动文件(整理后删除源文件,默认只复制更安全)", nil)
+	moveChk.Hide()
 	dedupeChk := widget.NewCheck("去重(相同内容只留一份)", nil)
 	dedupeChk.SetChecked(true)
 	offsetEntry := widget.NewEntry()
@@ -113,6 +116,20 @@ func main() {
 	suffixEntry.SetPlaceHolder("文件名后缀(可选)")
 	suffixEntry.SetText("")
 
+	// 『高级选项』: 折叠区,默认收起。危险操作(移动文件)放到这里,避免误触。
+	advancedOpen := false
+	advancedBtn := widget.NewButton("高级选项 ▸", func() {
+		advancedOpen = !advancedOpen
+		if advancedOpen {
+			advancedBtn.SetText("高级选项 ▾")
+			moveChk.Show()
+		} else {
+			advancedBtn.SetText("高级选项 ▸")
+			moveChk.Hide()
+			// 收起时若曾勾选过移动,保留勾选状态但提示危险。
+		}
+	})
+
 	logEntry := widget.NewMultiLineEntry()
 	logEntry.Disable()
 	logEntry.SetPlaceHolder("运行日志会显示在这里")
@@ -165,7 +182,7 @@ func main() {
 			mode = "ym"
 			modeGroup.SetSelected("年/月")
 		}
-		moveChk.SetChecked(s.Move)
+		// 移动文件属危险操作,一律默认不勾选(默认只复制),即使上次保存过也不自动启用
 		dedupeChk.SetChecked(s.Dedupe)
 		offsetEntry.SetText(strconv.Itoa(s.Offset))
 		// 恢复格式选择: 保存了具体扩展名则取消"全部"并按保存值勾选
@@ -337,9 +354,25 @@ func main() {
 		doneCh := make(chan core.Result, 1)
 
 		go func() {
-			res := core.Run(opt, func(s string) { ch <- s })
-			doneCh <- res
-			close(ch) // 关闭日志通道,让消费者循环退出,从而恢复按钮并输出最终状态
+			// defer 兜底: 即使 core.Run 内部发生 panic,也保证 doneCh 通知与 close(ch)
+			// 一定执行,避免消费者 goroutine 永久阻塞导致『预览/开始整理』按钮一直禁用
+			// (即用户遇到的:执行一遍后按钮变灰、必须重启)。
+			var res core.Result
+			defer func() {
+				if r := recover(); r != nil {
+					res.Cancelled = false
+					res.Processed = -1 // 标记异常,供最终状态展示
+					fyne.Do(func() {
+						logEntry.SetText(logEntry.Text + fmt.Sprintf("\n[错误] 处理过程中发生异常,已中止: %v\n", r))
+					})
+				}
+				select {
+				case doneCh <- res:
+				default:
+				}
+				close(ch) // 关闭日志通道,让消费者循环退出,从而恢复按钮并输出最终状态
+			}()
+			res = core.Run(opt, func(s string) { ch <- s })
 		}()
 
 		go func() {
@@ -354,6 +387,15 @@ func main() {
 				total := atomic.LoadInt64(&totalFiles)
 				if total <= 0 {
 					total = int64(res.Processed)
+				}
+				if res.Processed < 0 {
+					// 处理过程发生 panic: 展示异常信息,按钮照常恢复
+					status.SetText("异常中止: 处理过程中发生未捕获错误,详情见日志。按钮已恢复,可重新操作。")
+					setButtonsRunning(false)
+					cancelFunc = nil
+					cancelBtn.SetText("取消")
+					logEntry.Disable()
+					return
 				}
 				if res.Cancelled {
 					// 取消时不强制进度条置满,保留中断时的实际进度
@@ -451,7 +493,8 @@ func main() {
 			container.NewHBox(widget.NewLabel("目录结构:"), modeGroup,
 				widget.NewLabel("  时间偏移(秒):"), offsetEntry),
 			container.NewHBox(widget.NewLabel("处理日期:"), timeFilterSel),
-			container.NewHBox(moveChk, dedupeChk),
+			container.NewHBox(dedupeChk),
+			container.NewHBox(advancedBtn, moveChk), // 危险操作(移动)默认收起在『高级选项』
 			container.NewHBox(widget.NewLabel("处理格式:"), formatAllChk, formatRow1),
 			formatRow2,
 			container.NewHBox(keepNameChk),
