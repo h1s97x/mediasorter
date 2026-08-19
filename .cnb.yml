@@ -57,7 +57,10 @@
         script: |
           set -e
           cd go
-          go test ./internal/core/
+          go vet ./internal/core/
+          go test -race -count=1 ./internal/core/
+          go test -coverprofile=coverage.out ./internal/core/
+          go tool cover -func=coverage.out | tail -1
       build-cli: *x-build-cli
       build-gui-linux: *x-build-gui-linux
       build-gui-windows: *x-build-gui-windows
