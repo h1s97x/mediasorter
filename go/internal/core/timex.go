@@ -21,26 +21,32 @@ var (
 func parseFileNameTime(name string) (time.Time, bool) {
 	if m := nameDateTimeRe.FindStringSubmatch(name); m != nil {
 		if t, err := time.ParseInLocation("20060102150405", m[1]+m[2], time.Local); err == nil {
-			return t, true
+			// 防止 2月30日 之类非法日期被 Go 自动进位
+			// 通过反向格式化成原串比较验证日期合法
+			if t.Format("20060102150405") == m[1]+m[2] {
+				return t, true
+			}
 		}
 	}
+
 	if m := nameDashRe.FindStringSubmatch(name); m != nil {
 		hm := m[4]
 		if len(hm) == 6 {
+			// 用 ParseInLocation + 反向格式化验证日期合法,
+			// 防止 2月30日 之类非法日期被 Go 自动进位。
+			// Go 的 time 支持 year 0,需显式排除 0000 年
 			y, _ := strconv.Atoi(m[1])
-			mo, _ := strconv.Atoi(m[2])
-			d, _ := strconv.Atoi(m[3])
-			h, _ := strconv.Atoi(hm[0:2])
-			mi, _ := strconv.Atoi(hm[2:4])
-			s, _ := strconv.Atoi(hm[4:6])
-			if y > 0 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31 {
-				t := time.Date(y, time.Month(mo), d, h, mi, s, 0, time.Local)
-				if t.Year() == y { // 防止 2月30日 之类非法日期被 Go 自动进位
-					return t, true
+			if y > 0 {
+				str := m[1] + "-" + m[2] + "-" + m[3] + " " + hm
+				if t, err := time.ParseInLocation("2006-01-02 150405", str, time.Local); err == nil {
+					if t.Format("2006-01-02 150405") == str {
+						return t, true
+					}
 				}
 			}
 		}
 	}
+
 	if m := unixMsRe.FindStringSubmatch(name); m != nil {
 		if v, err := strconv.ParseInt(m[1], 10, 64); err == nil && v >= 1_000_000_000_000 && v <= 20_000_000_000_000 {
 			return time.Unix(v/1000, 0).Local(), true

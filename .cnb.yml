@@ -57,10 +57,19 @@
         script: |
           set -e
           cd go
+          # 静态检查
           go vet ./internal/core/
+          # 单测 + race 检测(并发模型健壮性)
           go test -race -count=1 ./internal/core/
+          # 覆盖率统计(不因覆盖率低而失败,仅输出)
           go test -coverprofile=coverage.out ./internal/core/
-          go tool cover -func=coverage.out | tail -1
+          go tool cover -func=coverage.out | tail -5
+          # fuzz 种子测试快速冒烟(每个 fuzz 函数跑短时间)
+          # 若 fuzz 发现崩溃会落盘 corpus 并返回非零,触发 CI 失败告警
+          go test -run=^$ -fuzz=FuzzParseJpegExifTime -fuzztime=2s ./internal/core/
+          go test -run=^$ -fuzz=FuzzParseMp4CreationTime -fuzztime=2s ./internal/core/
+          go test -run=^$ -fuzz=FuzzParseHeifExifTime -fuzztime=2s ./internal/core/
+          go test -run=^$ -fuzz=FuzzParseTiffDateTime -fuzztime=2s ./internal/core/
       build-cli: *x-build-cli
       build-gui-linux: *x-build-gui-linux
       build-gui-windows: *x-build-gui-windows

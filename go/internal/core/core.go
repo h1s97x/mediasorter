@@ -448,6 +448,10 @@ func copyFile(src, dst string, ctx context.Context) error {
 		}
 	}()
 	// 64KB 分块复制,便于在复制过程中检查取消信号。
+	// 传入 nil context 时视为不可取消(供测试/无取消需求场景调用)。
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	buf := make([]byte, 64*1024)
 	for {
 		if ctx.Err() != nil {
