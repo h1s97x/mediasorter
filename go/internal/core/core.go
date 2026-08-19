@@ -40,6 +40,15 @@ type Options struct {
 	//   "has"   = 仅处理有录制日期(EXIF/视频元数据)的文件
 	//   "none"  = 仅处理无录制日期(只能靠文件名/文件时间兜底)的文件
 	TimeFilter string
+	// StrictTime true=严格时间模式: 只认 EXIF/视频元数据,不把文件名时间戳或
+	// 文件修改时间当作拍摄时间。用于避免把 mtime/文件名时间误当拍摄时间造成误排。
+	// 默认 false(四级兜底: EXIF -> 元数据 -> 文件名 -> 文件时间)。
+	StrictTime bool
+	// OnConflict 目标目录存在同名文件时的处理策略:
+	//   "sequence" = 自动加序号(默认,绝不覆盖,最安全)
+	//   "skip"     = 跳过该文件(计为跳过,不复制/移动)
+	//   "overwrite"= 覆盖目标(危险,会丢失已存在目标文件,不建议默认开启)
+	OnConflict string
 	// OnProgress 进度回调,可空。done=已处理, total=本次总文件数。
 	// 注:total 为本次要处理的总数(去重后;扫描得到原始总数后去重会减少),
 	// 进度条应以 OnProgress 的 total 为分母,避免去重前后进度跳变。
@@ -64,10 +73,12 @@ type Result struct {
 	Processed   int
 	Duplicates  int
 	Failed      int
+	Skipped     int // 因同名冲突而按"跳过"策略跳过的文件数
 	Cancelled   bool // true 表示运行因取消而提前终止(仍可能已处理部分文件)
 	TimeSpanMin time.Time
 	TimeSpanMax time.Time
 	SourceCount map[string]int
+	FailedFiles []string // 失败(含跳过)的源文件路径列表,供报告导出
 }
 
 var imageExts = map[string]bool{
@@ -276,6 +287,21 @@ func Run(opt Options, log func(string)) Result {
 		if degradeMsg != "" {
 			emit(degradeMsg)
 		}
+		// 严格时间模式: 只认 EXIF/视频元数据,不把文件名时间戳或文件修改时间
+		// 当作拍摄时间(避免 mtime/文件名时间被误当拍摄时间造成误排)。
+		if opt.StrictTime && ok && srcTag != "EXIF" && srcTag != "meta" {
+			// 严格时间模式: 只认 EXIF/视频元数据。此类文件虽能兜底取到时间,
+			// 但来源不是 EXIF/meta,无法通过严格校验,故无法归档。统计口径计为
+			// 失败(与"无法读取任何时间"分支一致),文案明示"跳过计为失败"以免
+			// 与真正的同名跳过(res.Skipped)语义混淆。
+			emit("[失败] 严格时间模式下无法从 EXIF/元数据读取拍摄时间,已跳过: " + f)
+			res.Failed++
+			res.FailedFiles = append(res.FailedFiles, f)
+			done++
+			progress()
+			mu.Unlock()
+			return
+		}
 		// 按录制日期筛选: 只处理符合要求来源的文件
 		if !matchesTimeFilter(srcTag, ok, opt.TimeFilter) {
 			if opt.TimeFilter == "has" {
@@ -291,6 +317,7 @@ func Run(opt Options, log func(string)) Result {
 		if !ok {
 			emit("[跳过] 无法读取任何时间: " + f)
 			res.Failed++
+			res.FailedFiles = append(res.FailedFiles, f)
 			done++
 			progress()
 			mu.Unlock()
@@ -308,24 +335,67 @@ func Run(opt Options, log func(string)) Result {
 
 		base := baseName(f, t, opt) // 不含扩展名
 		ext := strings.ToLower(filepath.Ext(f))
-		counter[base]++
-		seq := counter[base]
-		newName := fmt.Sprintf("%s_%03d%s", base, seq, ext)
 		sub := relDir(t, opt)
-		target := filepath.Join(opt.Dst, sub, newName)
-
-		// 同名冲突:递增序号,绝不覆盖。在锁内完成序号保留,确保并发下不重名。
-		guard := 0
-		for _, err := os.Stat(target); err == nil && guard < 999; _, err = os.Stat(target) {
-			seq++
+		// 按冲突策略决定目标文件名(锁内完成命名与存在性判断,确保并发下一致)。
+		conflict := opt.OnConflict
+		if conflict == "" {
+			conflict = "sequence" // 默认: 自动加序号,绝不覆盖
+		}
+		var newName string
+		var target string
+		if conflict == "skip" {
+			// 跳过策略: 目标已存在或本批次已有同名文件被处理过,则跳过该文件。
+			newName = base + ext
+			target = filepath.Join(opt.Dst, sub, newName)
+			// 冲突键需结合子目录维度,避免 KeepOriginal 下跨目录同名(拍摄日期不同,
+			// 归档到不同 sub 子目录)被误判为"本批次已处理"而误跳过。
+			conflictKey := sub + "/" + base
+			if counter[conflictKey] > 0 {
+				// 本批次已处理过同子目录同名文件(skip 语义:只保留第一个)
+				emit("[跳过] 同名文件已被处理,跳过: " + f)
+				res.Skipped++
+				res.FailedFiles = append(res.FailedFiles, f)
+				done++
+				progress()
+				mu.Unlock()
+				return
+			}
+			if _, err := os.Stat(target); err == nil {
+				emit("[跳过] 同名文件已存在,跳过: " + f)
+				res.Skipped++
+				res.FailedFiles = append(res.FailedFiles, f)
+				done++
+				progress()
+				mu.Unlock()
+				return
+			}
+			// 目标不存在: 正常处理(不加序号,因为 skip 场景默认预期无冲突)
+			counter[conflictKey] = 1
+			mu.Unlock()
+		} else if conflict == "overwrite" {
+			// 覆盖策略: 固定文件名,目标已存在则覆盖(危险)。
+			newName = base + ext
+			target = filepath.Join(opt.Dst, sub, newName)
+			counter[base] = 1
+			mu.Unlock()
+		} else {
+			// sequence 策略(默认): 递增序号,绝不覆盖。在锁内完成序号保留,确保并发下不重名。
+			counter[base]++
+			seq := counter[base]
 			newName = fmt.Sprintf("%s_%03d%s", base, seq, ext)
 			target = filepath.Join(opt.Dst, sub, newName)
-			guard++
+			guard := 0
+			for _, err := os.Stat(target); err == nil && guard < 999; _, err = os.Stat(target) {
+				seq++
+				newName = fmt.Sprintf("%s_%03d%s", base, seq, ext)
+				target = filepath.Join(opt.Dst, sub, newName)
+				guard++
+			}
+			// 关键: 将最终保留的序号回写 counter,保证后续 counter 分配从当前磁盘已用序号继续,
+			// 避免并发下另一 worker 分配到与本次已保留 target 相同的 seq 而相互覆盖。
+			counter[base] = seq
+			mu.Unlock()
 		}
-		// 关键: 将最终保留的序号回写 counter,保证后续 counter 分配从当前磁盘已用序号继续,
-		// 避免并发下另一 worker 分配到与本次已保留 target 相同的 seq 而相互覆盖。
-		counter[base] = seq
-		mu.Unlock()
 
 		// ---- 锁外: 实际 IO,多 worker 并行 ----
 		if !opt.DryRun {
@@ -333,13 +403,16 @@ func Run(opt Options, log func(string)) Result {
 				mu.Lock()
 				emit("[失败] " + f + " : " + err.Error())
 				res.Failed++
+				res.FailedFiles = append(res.FailedFiles, f)
 				done++
 				progress()
 				mu.Unlock()
 				return
 			}
 			var err error
-			if opt.Move {
+			// overwrite 策略下目标已存在时 os.Rename 在 Windows 会失败,
+			// 故统一走复制(天然覆盖目标);move 时复制后校验大小一致再删除源文件。
+			if opt.Move && conflict != "overwrite" {
 				// 优先同盘重命名;跨磁盘时 os.Rename 会失败,降级为复制+删除源文件
 				err = os.Rename(f, target)
 				if err != nil {
@@ -359,6 +432,19 @@ func Run(opt Options, log func(string)) Result {
 				}
 			} else {
 				err = copyFile(f, target, ctx)
+				// move + overwrite: 复制已覆盖目标,再删除源文件(校验大小防止半成品)
+				if err == nil && opt.Move && conflict == "overwrite" {
+					si, _ := os.Stat(f)
+					ti, _ := os.Stat(target)
+					if si != nil && ti != nil && si.Size() == ti.Size() {
+						err = os.Remove(f)
+					} else {
+						// 覆盖场景目标原为已存在文件,已写入新内容;仅当校验不一致时
+						// 保留已写入的目标文件(不删除),避免覆盖后目标侧旧数据也丢失,
+						// 只保留源文件并报错,交由用户人工核对。
+						err = errors.New("复制校验不一致,目标已保留(未删除源文件)")
+					}
+				}
 			}
 			if err != nil {
 				// 取消导致的错误不算失败: 取消状态已在主循环中标记,半成品已删除。
@@ -370,6 +456,7 @@ func Run(opt Options, log func(string)) Result {
 				mu.Lock()
 				emit("[失败] " + f + " : " + err.Error())
 				res.Failed++
+				res.FailedFiles = append(res.FailedFiles, f)
 				done++
 				progress()
 				mu.Unlock()

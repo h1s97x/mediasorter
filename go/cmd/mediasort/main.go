@@ -13,6 +13,8 @@
 //	--year        仅按年分目录
 //	--day         按 年/月/日 分目录
 //	--jobs N      并发 worker 数(默认 CPU 核数;=1 串行)
+//	--strict-time 严格时间模式(只认 EXIF/元数据,不把文件名/文件时间当拍摄时间)
+//	--conflict=策略 同名文件处理: sequence(默认加序号) | skip | overwrite
 package main
 
 import (
@@ -58,6 +60,17 @@ func main() {
 			} else {
 				fmt.Println("警告: --jobs 需为正整数,忽略该值")
 			}
+		case a == "--strict-time":
+			opt.StrictTime = true
+		case strings.HasPrefix(a, "--conflict="):
+			switch strings.TrimPrefix(a, "--conflict=") {
+			case "skip":
+				opt.OnConflict = "skip"
+			case "overwrite":
+				opt.OnConflict = "overwrite"
+			default:
+				opt.OnConflict = "sequence"
+			}
 		case strings.HasPrefix(a, "--"):
 			fmt.Println("未知选项:", a)
 		default:
@@ -95,8 +108,8 @@ func main() {
 		fmt.Printf("时间跨度: %s ~ %s\n",
 			res.TimeSpanMin.Format("2006-01-02 15:04"), res.TimeSpanMax.Format("2006-01-02 15:04"))
 	}
-	fmt.Printf("完成: 处理 %d 个, 去重跳过 %d 个, 失败 %d 个\n",
-		res.Processed, res.Duplicates, res.Failed)
+	fmt.Printf("完成: 处理 %d 个, 去重跳过 %d 个, 失败 %d 个, 同名跳过 %d 个\n",
+		res.Processed, res.Duplicates, res.Failed, res.Skipped)
 	if res.SourceCount["mtime"] > 0 {
 		fmt.Printf("提示: %d 个文件时间来自修改时间(视频元数据/文件名均无时间),仅供参考\n",
 			res.SourceCount["mtime"])
@@ -110,7 +123,7 @@ func printHelp() {
 	fmt.Println("用法一(最简单): 把照片文件夹拖到本程序图标上,松手")
 	fmt.Println("  结果生成在源文件夹的上一级目录『MediaSorter』,按 年/月 排好")
 	fmt.Println("用法二(命令行): mediasort <源文件夹> [目标文件夹] [选项]")
-	fmt.Println("  选项: --move | --no-dedupe | --dry-run | --offset=秒 | --year | --day | --jobs=并发数")
+	fmt.Println("  选项: --move | --no-dedupe | --dry-run | --offset=秒 | --year | --day | --jobs=并发数 | --strict-time | --conflict=策略")
 }
 
 func waitExit() {

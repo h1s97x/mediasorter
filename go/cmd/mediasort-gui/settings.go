@@ -24,6 +24,8 @@ type settings struct {
 	NamePrefix   string   `json:"name_prefix,omitempty"`
 	NameSuffix   string   `json:"name_suffix,omitempty"`
 	TimeFilter   string   `json:"time_filter,omitempty"` // "" | "has" | "none"
+	OnConflict   string   `json:"on_conflict,omitempty"`   // "sequence" | "skip" | "overwrite"
+	StrictTime   bool     `json:"strict_time,omitempty"`   // 严格时间模式
 }
 
 // settingsPath 返回配置文件路径,并确保其所在目录存在

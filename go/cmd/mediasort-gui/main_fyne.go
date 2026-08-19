@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -50,10 +51,32 @@ func main() {
 	})
 	modeGroup.SetSelected("年/月")
 
-	// 危险操作归入『高级选项』折叠区,默认展开(false)。
-	// 移动文件会删除源文件,属破坏性操作,故不放主界面、也不默认勾选。
+	// ============ 『高级选项』折叠区内容(默认收起) ============
+	// 危险/低频/进阶设置全部收进高级区,主界面只留高频安全项,降低误触风险。
+
+	// 危险: 移动文件会删除源文件,一律默认不勾选。
+	// 勾选时弹一次确认框,让用户明确知悉"移动=删除源文件"的不可逆后果。
 	moveChk := widget.NewCheck("移动文件(整理后删除源文件,默认只复制更安全)", nil)
-	moveChk.Hide()
+	moveChk.OnChanged = func(on bool) {
+		if !on {
+			return
+		}
+		// 勾选时确认: 移动=复制+删除源文件,不可恢复。
+		confirm := dialog.NewConfirm(
+			"确认启用移动文件",
+			"开启后将删除源文件夹中的原始文件,且不可恢复。确定启用吗?\n\n(可先『预览』确认结果无误后再开启移动)",
+			func(ok bool) {
+				if !ok {
+					// 取消则回退勾选状态,保持"默认只复制"的安全默认。
+					moveChk.SetChecked(false)
+				}
+			},
+			w,
+		)
+		confirm.SetConfirmText("启用移动")
+		confirm.SetDismissText("取消")
+		confirm.Show()
+	}
 	dedupeChk := widget.NewCheck("去重(相同内容只留一份)", nil)
 	dedupeChk.SetChecked(true)
 	offsetEntry := widget.NewEntry()
@@ -73,6 +96,33 @@ func main() {
 			}
 		})
 	timeFilterSel.SetSelected("全部文件")
+
+	// 命名选项: 保留原始文件名 + 自定义前缀/后缀
+	keepNameChk := widget.NewCheck("保留原始文件名(默认按拍摄时间命名)", nil)
+	prefixEntry := widget.NewEntry()
+	prefixEntry.SetPlaceHolder("文件名前缀(可选)")
+	prefixEntry.SetText("")
+	suffixEntry := widget.NewEntry()
+	suffixEntry.SetPlaceHolder("文件名后缀(可选)")
+	suffixEntry.SetText("")
+
+	// 同名文件冲突策略(默认: 自动加序号,最安全)
+	conflict := "sequence"
+	conflictSel := widget.NewSelect([]string{"自动加序号", "跳过", "覆盖"},
+		func(s string) {
+			switch s {
+			case "跳过":
+				conflict = "skip"
+			case "覆盖":
+				conflict = "overwrite"
+			default:
+				conflict = "sequence"
+			}
+		})
+	conflictSel.SetSelected("自动加序号")
+
+	// 严格时间模式: 只认 EXIF/元数据,避免 mtime/文件名时间被误当拍摄时间
+	strictChk := widget.NewCheck("严格时间(只认 EXIF/元数据,不把文件名/文件时间当拍摄时间)", nil)
 
 	// 格式选择: 勾选的扩展名才处理;全选 = 全部格式
 	formatExts := []string{".jpg", ".heic", ".heif", ".png", ".webp", ".gif", ".mp4", ".mov"}
@@ -107,16 +157,8 @@ func main() {
 	}
 	formatAllChk.SetChecked(true)
 
-	// 命名选项: 保留原始文件名 + 自定义前缀/后缀
-	keepNameChk := widget.NewCheck("保留原始文件名(默认按拍摄时间命名)", nil)
-	prefixEntry := widget.NewEntry()
-	prefixEntry.SetPlaceHolder("文件名前缀(可选)")
-	prefixEntry.SetText("")
-	suffixEntry := widget.NewEntry()
-	suffixEntry.SetPlaceHolder("文件名后缀(可选)")
-	suffixEntry.SetText("")
-
-	// 『高级选项』: 折叠区,默认收起。危险操作(移动文件)放到这里,避免误触。
+	// 『高级选项』: 折叠区,默认收起。危险/低频/进阶设置全部收纳于此,
+	// 主界面只保留高频安全项。展开时用 HBox 容器统一 Show,收起则 Hide。
 	advancedOpen := false
 	// 先声明后赋值: 闭包回调在按钮被点击时才执行,彼时 advancedBtn 已指向按钮实例;
 	// 若在同一条 := 语句的初始化闭包内引用自身,会因作用域未生效报 "undefined: advancedBtn"。
@@ -125,13 +167,32 @@ func main() {
 		advancedOpen = !advancedOpen
 		if advancedOpen {
 			advancedBtn.SetText("高级选项 ▾")
-			moveChk.Show()
+			advancedContent.Show()
 		} else {
 			advancedBtn.SetText("高级选项 ▸")
-			moveChk.Hide()
-			// 收起时若曾勾选过移动,保留勾选状态但提示危险。
+			advancedContent.Hide()
 		}
 	})
+
+	// 高级区内容: 统一放进一个 VBox,展开/收起整体控制显示。
+	// 危险项(移动文件)用醒目标注提醒,避免误触。
+	moveLabel := widget.NewLabel("⚠ 危险操作")
+	moveLabel.Importance = widget.DangerImportance
+	advancedContent := container.NewVBox(
+		container.NewVBox(
+			moveLabel,
+			moveChk,
+		),
+		dedupeChk,
+		container.NewHBox(widget.NewLabel("时间偏移(秒):"), offsetEntry),
+		container.NewHBox(widget.NewLabel("处理日期:"), timeFilterSel),
+		keepNameChk,
+		container.NewHBox(widget.NewLabel("文件名前缀:"), prefixEntry,
+			widget.NewLabel("  文件名后缀:"), suffixEntry),
+		container.NewHBox(widget.NewLabel("同名文件:"), conflictSel),
+		strictChk,
+	)
+	advancedContent.Hide()
 
 	logEntry := widget.NewMultiLineEntry()
 	logEntry.Disable()
@@ -215,6 +276,20 @@ func main() {
 			timeFilter = ""
 			timeFilterSel.SetSelected("全部文件")
 		}
+		// 恢复同名冲突策略
+		switch s.OnConflict {
+		case "skip":
+			conflict = "skip"
+			conflictSel.SetSelected("跳过")
+		case "overwrite":
+			conflict = "overwrite"
+			conflictSel.SetSelected("覆盖")
+		default:
+			conflict = "sequence"
+			conflictSel.SetSelected("自动加序号")
+		}
+		// 恢复严格时间模式
+		strictChk.SetChecked(s.StrictTime)
 	}
 
 	// setButtonsRunning 统一管理运行期间按钮状态
@@ -262,6 +337,12 @@ func main() {
 		keepOriginal := keepNameChk.Checked
 		prefix := prefixEntry.Text
 		suffix := suffixEntry.Text
+		// 同名文件冲突策略与严格时间模式
+		onConflict := conflict
+		if onConflict == "" {
+			onConflict = "sequence"
+		}
+		strict := strictChk.Checked
 		// 保存设置,供下次启动恢复(静默失败,不影响整理)
 		_ = saveSettings(settings{
 			Src:          srcEntry.Text,
@@ -275,6 +356,8 @@ func main() {
 			NamePrefix:   prefix,
 			NameSuffix:   suffix,
 			TimeFilter:   timeFilter,
+			OnConflict:   onConflict,
+			StrictTime:   strict,
 		})
 		return core.Options{
 			Src: src, Dst: dst,
@@ -286,6 +369,8 @@ func main() {
 			NamePrefix:   prefix,
 			NameSuffix:   suffix,
 			TimeFilter:   timeFilter,
+			OnConflict:   onConflict,
+			StrictTime:   strict,
 			Year:         mode == "y",
 			Day:          mode == "ymd",
 			OnProgress: func(done, total int) {
@@ -331,6 +416,37 @@ func main() {
 				})
 			},
 		}, ""
+	}
+
+	// 失败清单导出: 运行完成后若存在失败/跳过的文件,启用该按钮导出到 txt 报告。
+	// (定义在 run 之前,供 run 结束后更新其状态)
+	exportBtn := widget.NewButton("导出失败清单", nil)
+	exportBtn.Disable()
+	var lastFailedFiles []string // 保存最近一次运行的失败清单
+	exportBtn.OnTapped = func() {
+		if len(lastFailedFiles) == 0 {
+			dialog.ShowInformation("提示", "本次没有失败文件可导出。", w)
+			return
+		}
+		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
+			if uri == nil {
+				return
+			}
+			p := uri.Path()
+			out := filepath.Join(p, fmt.Sprintf("mediasorter-failed-%s.txt", time.Now().Format("20060102-150405")))
+			var sb strings.Builder
+			sb.WriteString("# MediaSorter 失败/跳过文件清单\n")
+			sb.WriteString(fmt.Sprintf("# 生成时间: %s\n", time.Now().Format("2006-01-02 15:04:05")))
+			sb.WriteString(fmt.Sprintf("# 共 %d 个文件\n\n", len(lastFailedFiles)))
+			for _, fpath := range lastFailedFiles {
+				sb.WriteString(fpath + "\n")
+			}
+			if err := os.WriteFile(out, []byte(sb.String()), 0o600); err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			dialog.ShowInformation("导出成功", "失败清单已导出到:\n"+out, w)
+		}, w)
 	}
 
 	// run 执行整理(预览或正式),统一驱动进度条/日志/状态。
@@ -405,16 +521,16 @@ func main() {
 					if total > 0 {
 						progress.SetValue(float64(res.Processed) / float64(total))
 					}
-					status.SetText(fmt.Sprintf("已取消: 本次已处理 %d / %d 个, 去重 %d, 失败 %d",
-						res.Processed, total, res.Duplicates, res.Failed))
+					status.SetText(fmt.Sprintf("已取消: 本次已处理 %d / %d 个, 去重 %d, 失败 %d, 跳过 %d",
+						res.Processed, total, res.Duplicates, res.Failed, res.Skipped))
 				} else if opt.DryRun {
-					status.SetText(fmt.Sprintf("预览完成: 将处理 %d / %d 个, 去重 %d, 失败 %d",
-						res.Processed, total, res.Duplicates, res.Failed))
+					status.SetText(fmt.Sprintf("预览完成: 将处理 %d / %d 个, 去重 %d, 失败 %d, 跳过 %d",
+						res.Processed, total, res.Duplicates, res.Failed, res.Skipped))
 					status.SetText(status.Text + "\n以上是预览结果,未做任何复制/移动。确认无误后点『开始整理』正式执行。")
 				} else {
 					progress.SetValue(1)
-					status.SetText(fmt.Sprintf("完成: 处理 %d / %d 个, 去重 %d, 失败 %d",
-						res.Processed, total, res.Duplicates, res.Failed))
+					status.SetText(fmt.Sprintf("完成: 处理 %d / %d 个, 去重 %d, 失败 %d, 跳过 %d",
+						res.Processed, total, res.Duplicates, res.Failed, res.Skipped))
 				}
 				if !res.TimeSpanMin.IsZero() {
 					status.SetText(status.Text + fmt.Sprintf("\n时间跨度: %s ~ %s",
@@ -424,6 +540,13 @@ func main() {
 				if res.SourceCount["mtime"] > 0 {
 					status.SetText(status.Text + fmt.Sprintf("\n提示: %d 个文件时间来自修改时间,仅供参考",
 						res.SourceCount["mtime"]))
+				}
+				// 更新失败清单导出: 有失败/跳过的文件时启用导出按钮
+				lastFailedFiles = res.FailedFiles
+				if len(lastFailedFiles) > 0 {
+					exportBtn.Enable()
+				} else {
+					exportBtn.Disable()
 				}
 				setButtonsRunning(false)
 				cancelFunc = nil
@@ -444,7 +567,8 @@ func main() {
 		run(opt, "预览(--dry-run,不会复制/移动任何文件)")
 	}
 
-	// 开始整理: 正式执行
+	// 开始整理: 正式执行。若已勾选"移动文件",在正式整理前做第二次确认
+	// (勾选时已确认过一次,此处为执行前最后一道闸),避免误点直接删源文件。
 	startBtn.OnTapped = func() {
 		opt, errMsg := buildOptions()
 		if errMsg != "" {
@@ -452,6 +576,22 @@ func main() {
 			return
 		}
 		opt.DryRun = false
+		if opt.Move {
+			confirm := dialog.NewConfirm(
+				"二次确认",
+				"你已启用『移动文件』。\n正式整理将把源文件夹中的文件移动到目标目录,并删除源文件,不可恢复。\n\n确定开始吗?",
+				func(ok bool) {
+					if ok {
+						run(opt, "正式整理(移动文件)")
+					}
+				},
+				w,
+			)
+			confirm.SetConfirmText("确定移动")
+			confirm.SetDismissText("取消")
+			confirm.Show()
+			return
+		}
 		run(opt, "正式整理")
 	}
 
@@ -493,17 +633,12 @@ func main() {
 		container.NewVBox(
 			container.NewBorder(nil, nil, widget.NewLabel("源文件夹:"), srcBtn, srcEntry),
 			container.NewBorder(nil, nil, widget.NewLabel("目标文件夹:"), dstBtn, dstEntry),
-			container.NewHBox(widget.NewLabel("目录结构:"), modeGroup,
-				widget.NewLabel("  时间偏移(秒):"), offsetEntry),
-			container.NewHBox(widget.NewLabel("处理日期:"), timeFilterSel),
-			container.NewHBox(dedupeChk),
-			container.NewHBox(advancedBtn, moveChk), // 危险操作(移动)默认收起在『高级选项』
+			container.NewHBox(widget.NewLabel("目录结构:"), modeGroup),
 			container.NewHBox(widget.NewLabel("处理格式:"), formatAllChk, formatRow1),
 			formatRow2,
-			container.NewHBox(keepNameChk),
-			container.NewHBox(widget.NewLabel("文件名前缀:"), prefixEntry,
-				widget.NewLabel("  文件名后缀:"), suffixEntry),
-			container.NewHBox(previewBtn, startBtn, cancelBtn),
+			container.NewHBox(advancedBtn), // 『高级选项』折叠开关
+			advancedContent,               // 高级区内容(默认隐藏,展开时才显示)
+			container.NewHBox(previewBtn, startBtn, cancelBtn, exportBtn),
 			progress,
 			scanProgress,
 			status,
