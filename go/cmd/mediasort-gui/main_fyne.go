@@ -118,7 +118,10 @@ func main() {
 
 	// 『高级选项』: 折叠区,默认收起。危险操作(移动文件)放到这里,避免误触。
 	advancedOpen := false
-	advancedBtn := widget.NewButton("高级选项 ▸", func() {
+	// 先声明后赋值: 闭包回调在按钮被点击时才执行,彼时 advancedBtn 已指向按钮实例;
+	// 若在同一条 := 语句的初始化闭包内引用自身,会因作用域未生效报 "undefined: advancedBtn"。
+	var advancedBtn *widget.Button
+	advancedBtn = widget.NewButton("高级选项 ▸", func() {
 		advancedOpen = !advancedOpen
 		if advancedOpen {
 			advancedBtn.SetText("高级选项 ▾")
