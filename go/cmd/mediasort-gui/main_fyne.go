@@ -28,7 +28,7 @@ import (
 func main() {
 	a := app.New()
 	w := a.NewWindow("MediaSorterGo - 按拍摄时间整理照片视频")
-	w.Resize(fyne.NewSize(780, 640))
+	w.Resize(fyne.NewSize(820, 720))
 
 	srcEntry := widget.NewEntry()
 	srcEntry.SetPlaceHolder("手机导出的照片文件夹(可整个 U 盘,也可直接拖放到窗口)")
@@ -88,7 +88,7 @@ func main() {
 			formatRow2.Add(c)
 		}
 	}
-	// 全部开关: 勾选则全选并禁用各格式复选框,取消则启用各复选框
+	// 全部开关: 勾选则全选并禁用各格式复选框,取消则取消全部勾选并启用各复选框
 	formatAllChk.OnChanged = func(all bool) {
 		if all {
 			for _, c := range formatChecks {
@@ -97,6 +97,7 @@ func main() {
 			}
 		} else {
 			for _, c := range formatChecks {
+				c.SetChecked(false) // 取消全部时同步取消各格式勾选,保持状态自洽
 				c.Enable()
 			}
 		}
@@ -233,6 +234,10 @@ func main() {
 		}
 		// 计算要处理的扩展名(全选 = 空切片 = 全部格式)
 		exts := collectExtensions(formatChecks)
+		// 若取消全部后一个格式都没选,提示用户至少勾选一种格式
+		if !formatAllChk.Checked && len(exts) == 0 {
+			return core.Options{}, "请至少勾选一种处理格式,或勾选『全部』"
+		}
 		// 命名选项: 保留原始文件名 + 前缀/后缀
 		keepOriginal := keepNameChk.Checked
 		prefix := prefixEntry.Text
@@ -345,12 +350,15 @@ func main() {
 			}
 			res := <-doneCh
 			fyne.Do(func() {
-				progress.SetValue(1)
 				total := atomic.LoadInt64(&totalFiles)
 				if total <= 0 {
 					total = int64(res.Processed)
 				}
 				if res.Cancelled {
+					// 取消时不强制进度条置满,保留中断时的实际进度
+					if total > 0 {
+						progress.SetValue(float64(res.Processed) / float64(total))
+					}
 					status.SetText(fmt.Sprintf("已取消: 本次已处理 %d / %d 个, 去重 %d, 失败 %d",
 						res.Processed, total, res.Duplicates, res.Failed))
 				} else if opt.DryRun {
@@ -358,6 +366,7 @@ func main() {
 						res.Processed, total, res.Duplicates, res.Failed))
 					status.SetText(status.Text + "\n以上是预览结果,未做任何复制/移动。确认无误后点『开始整理』正式执行。")
 				} else {
+					progress.SetValue(1)
 					status.SetText(fmt.Sprintf("完成: 处理 %d / %d 个, 去重 %d, 失败 %d",
 						res.Processed, total, res.Duplicates, res.Failed))
 				}
@@ -373,6 +382,7 @@ func main() {
 				setButtonsRunning(false)
 				cancelFunc = nil
 				cancelBtn.SetText("取消")
+				logEntry.Disable() // 运行结束,禁止编辑日志区
 			})
 		}()
 	}
@@ -430,23 +440,28 @@ func main() {
 		}
 	})
 
-	content := container.NewVBox(
-		container.NewBorder(nil, nil, widget.NewLabel("源文件夹:"), srcBtn, srcEntry),
-		container.NewBorder(nil, nil, widget.NewLabel("目标文件夹:"), dstBtn, dstEntry),
-		container.NewHBox(widget.NewLabel("目录结构:"), modeGroup,
-			widget.NewLabel("  时间偏移(秒):"), offsetEntry),
-		container.NewHBox(widget.NewLabel("处理日期:"), timeFilterSel),
-		container.NewHBox(moveChk, dedupeChk),
-		container.NewHBox(widget.NewLabel("处理格式:"), formatAllChk, formatRow1),
-		formatRow2,
-		container.NewHBox(keepNameChk),
-		container.NewHBox(widget.NewLabel("文件名前缀:"), prefixEntry,
-			widget.NewLabel("  文件名后缀:"), suffixEntry),
-		container.NewHBox(previewBtn, startBtn, cancelBtn),
-		progress,
-		scanProgress,
-		status,
-		container.NewVBox(widget.NewLabel("日志:"), logEntry),
+	// 日志区: 独立固定高度,避免被挤压成一行
+	logBox := container.NewVBox(widget.NewLabel("日志:"), logEntry)
+	// 用 Scroll 包裹日志区内容,确保高度可控
+	content := container.NewVScroll(
+		container.NewVBox(
+			container.NewBorder(nil, nil, widget.NewLabel("源文件夹:"), srcBtn, srcEntry),
+			container.NewBorder(nil, nil, widget.NewLabel("目标文件夹:"), dstBtn, dstEntry),
+			container.NewHBox(widget.NewLabel("目录结构:"), modeGroup,
+				widget.NewLabel("  时间偏移(秒):"), offsetEntry),
+			container.NewHBox(widget.NewLabel("处理日期:"), timeFilterSel),
+			container.NewHBox(moveChk, dedupeChk),
+			container.NewHBox(widget.NewLabel("处理格式:"), formatAllChk, formatRow1),
+			formatRow2,
+			container.NewHBox(keepNameChk),
+			container.NewHBox(widget.NewLabel("文件名前缀:"), prefixEntry,
+				widget.NewLabel("  文件名后缀:"), suffixEntry),
+			container.NewHBox(previewBtn, startBtn, cancelBtn),
+			progress,
+			scanProgress,
+			status,
+			logBox,
+		),
 	)
 	w.SetContent(content)
 	w.ShowAndRun()
