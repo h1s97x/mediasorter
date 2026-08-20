@@ -100,10 +100,10 @@ func main() {
 	// 命名选项: 保留原始文件名 + 自定义前缀/后缀
 	keepNameChk := widget.NewCheck("保留原始文件名(默认按拍摄时间命名)", nil)
 	prefixEntry := widget.NewEntry()
-	prefixEntry.SetPlaceHolder("文件名前缀(可选)")
+	prefixEntry.SetPlaceHolder("如: 旅行_ → 旅行_2026-01-30_143105.jpg")
 	prefixEntry.SetText("")
 	suffixEntry := widget.NewEntry()
-	suffixEntry.SetPlaceHolder("文件名后缀(可选)")
+	suffixEntry.SetPlaceHolder("如: _整理 → 2026-01-30_143105_整理.jpg")
 	suffixEntry.SetText("")
 
 	// 同名文件冲突策略(默认: 自动加序号,最安全)
@@ -189,8 +189,10 @@ func main() {
 		container.NewHBox(widget.NewLabel("时间偏移(秒):"), offsetEntry),
 		container.NewHBox(widget.NewLabel("处理日期:"), timeFilterSel),
 		keepNameChk,
-		container.NewHBox(widget.NewLabel("文件名前缀:"), prefixEntry,
-			widget.NewLabel("  文件名后缀:"), suffixEntry),
+		// 命名选项说明
+		widget.NewLabel("文件名前后缀(加在文件名两侧,后缀位于扩展名之前):"),
+		container.NewBorder(nil, nil, widget.NewLabel("文件名前缀:"), nil, prefixEntry),
+		container.NewBorder(nil, nil, widget.NewLabel("文件名后缀:"), nil, suffixEntry),
 		container.NewHBox(widget.NewLabel("同名文件:"), conflictSel),
 		strictChk,
 	)
@@ -199,6 +201,10 @@ func main() {
 	logEntry := widget.NewMultiLineEntry()
 	logEntry.Disable()
 	logEntry.SetPlaceHolder("运行日志会显示在这里")
+	// 日志区: 设置合理的最小尺寸 + 自动换行。
+	// 尺寸过小导致内容拥挤;不换行时超长路径会横向溢出,需左右滑动查看。
+	logEntry.SetMinSize(fyne.NewSize(760, 280))
+	logEntry.Wrapping = fyne.TextWrapWord
 
 	// 进度条 + 状态
 	// progress: 处理阶段的确定进度条; scanProgress: 扫描阶段的无限进度条(动画)
