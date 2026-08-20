@@ -124,37 +124,121 @@ func main() {
 	// 严格时间模式: 只认 EXIF/元数据,避免 mtime/文件名时间被误当拍摄时间
 	strictChk := widget.NewCheck("严格时间(只认 EXIF/元数据,不把文件名/文件时间当拍摄时间)", nil)
 
-	// 格式选择: 勾选的扩展名才处理;全选 = 全部格式
-	formatExts := []string{".jpg", ".heic", ".heif", ".png", ".webp", ".gif", ".mp4", ".mov"}
-	formatChecks := make(map[string]*widget.Check, len(formatExts))
-	formatRow1 := container.NewHBox()
-	formatRow2 := container.NewHBox()
-	formatAllChk := widget.NewCheck("全部", nil)
-	for i, ext := range formatExts {
-		name := strings.ToUpper(strings.TrimPrefix(ext, "."))
-		c := widget.NewCheck(name, nil)
-		c.SetChecked(true)
-		formatChecks[ext] = c
-		if i < 5 {
-			formatRow1.Add(c)
-		} else {
-			formatRow2.Add(c)
-		}
+	// ===== 格式选择: 参考图分组 UI —— 全部格式 / 全部图片 / 全部视频 / 其他格式 =====
+	// 图片格式: 显示名 -> 实际扩展名(可含多个,如 JPG 覆盖 .jpg/.jpeg)
+	photoFormats := []struct {
+		label string
+		exts  []string
+		sup   string // 支持的元数据说明(参考图 JPG/HEIC 标 *)
+	}{
+		{"JPG", []string{".jpg", ".jpeg"}, "*"},
+		{"HEIC", []string{".heic", ".heif"}, "*"},
+		{"TIFF", []string{".tiff", ".tif"}, ""},
+		{"PNG", []string{".png"}, ""},
+		{"GIF", []string{".gif"}, ""},
+		{"BMP", []string{".bmp"}, ""},
+		{"WebP", []string{".webp"}, ""},
 	}
-	// 全部开关: 勾选则全选并禁用各格式复选框,取消则取消全部勾选并启用各复选框
-	formatAllChk.OnChanged = func(all bool) {
-		if all {
-			for _, c := range formatChecks {
-				c.SetChecked(true)
-				c.Disable()
+	// 视频格式
+	videoFormats := []struct {
+		label string
+		exts  []string
+		sup   string
+	}{
+		{"MP4", []string{".mp4", ".m4v"}, "*"},
+		{"MOV", []string{".mov"}, "*"},
+		{"AVI", []string{".avi"}, ""},
+		{"MKV", []string{".mkv"}, ""},
+		{"WMV", []string{".wmv"}, ""},
+		{"3GP", []string{".3gp"}, ""},
+		{"WebM", []string{".webm"}, ""},
+		{"FLV", []string{".flv"}, ""},
+	}
+	// 把所有格式的显示名 -> 复选框、扩展名集合映射出来,便于统一收集
+	formatChecks := make(map[string]*widget.Check)       // 扩展名 -> 复选框(用于恢复与收集)
+	formatCheckByLabel := make(map[string]*widget.Check) // 显示名 -> 复选框
+	// 全部开关(对应参考图「All file formats」)
+	formatAllChk := widget.NewCheck("全部格式", nil)
+	// 图片组: 全部图片 + 格式行
+	formatPhotoAllChk := widget.NewCheck("全部图片", nil)
+	photoRow := container.NewHBox()
+	for _, f := range photoFormats {
+		c := widget.NewCheck(f.label+f.sup, nil)
+		c.SetChecked(true)
+		formatCheckByLabel[f.label] = c
+		for _, e := range f.exts {
+			formatChecks[e] = c
+		}
+		photoRow.Add(c)
+	}
+	// 视频组: 全部视频 + 格式行
+	formatVideoAllChk := widget.NewCheck("全部视频", nil)
+	videoRow := container.NewHBox()
+	for _, f := range videoFormats {
+		c := widget.NewCheck(f.label+f.sup, nil)
+		c.SetChecked(true)
+		formatCheckByLabel[f.label] = c
+		for _, e := range f.exts {
+			formatChecks[e] = c
+		}
+		videoRow.Add(c)
+	}
+	// 其他格式: 用户自定义,逗号分隔(对应参考图「Remaining file formats」)
+	customFormatEntry := widget.NewEntry()
+	customFormatEntry.SetPlaceHolder("其他格式,用逗号分隔,如 RAW,DNG,NEF(留空=不额外处理)")
+
+	// 全部图片开关: 勾选则全选并禁用该组格式复选框,取消则取消该组勾选并启用
+	formatPhotoAllChk.OnChanged = func(all bool) {
+		for _, f := range photoFormats {
+			c := formatCheckByLabel[f.label]
+			if c == nil {
+				continue
 			}
-		} else {
-			for _, c := range formatChecks {
-				c.SetChecked(false) // 取消全部时同步取消各格式勾选,保持状态自洽
+			c.SetChecked(all)
+			if all {
+				c.Disable()
+			} else {
 				c.Enable()
 			}
 		}
 	}
+	// 全部视频开关: 同理
+	formatVideoAllChk.OnChanged = func(all bool) {
+		for _, f := range videoFormats {
+			c := formatCheckByLabel[f.label]
+			if c == nil {
+				continue
+			}
+			c.SetChecked(all)
+			if all {
+				c.Disable()
+			} else {
+				c.Enable()
+			}
+		}
+	}
+	// 全部格式开关: 勾选则全选并禁用图片/视频组所有复选框,取消则启用各组
+	formatAllChk.OnChanged = func(all bool) {
+		for _, c := range formatCheckByLabel {
+			c.SetChecked(all)
+			if all {
+				c.Disable()
+			} else {
+				c.Enable()
+			}
+		}
+		if all {
+			formatPhotoAllChk.SetChecked(true)
+			formatPhotoAllChk.Disable()
+			formatVideoAllChk.SetChecked(true)
+			formatVideoAllChk.Disable()
+		} else {
+			formatPhotoAllChk.Enable()
+			formatVideoAllChk.Enable()
+		}
+	}
+	formatPhotoAllChk.SetChecked(true)
+	formatVideoAllChk.SetChecked(true)
 	formatAllChk.SetChecked(true)
 
 	// 『高级选项』: 折叠区,默认收起。危险/低频/进阶设置全部收纳于此,
@@ -263,9 +347,26 @@ func main() {
 			for _, e := range s.Extensions {
 				saved[e] = true
 			}
-			formatAllChk.SetChecked(false) // 触发 OnChanged,启用各格式复选框
+			formatAllChk.SetChecked(false) // 触发 OnChanged,启用各组复选框
+			// 预设格式按保存值勾选
+			var customs []string
 			for ext, c := range formatChecks {
-				c.SetChecked(saved[ext])
+				if saved[ext] {
+					c.SetChecked(true)
+					c.Enable()
+				} else {
+					c.SetChecked(false)
+					c.Enable()
+				}
+			}
+			// 不在预设里的自定义扩展名写入自定义输入框
+			for _, e := range s.Extensions {
+				if _, known := formatChecks[e]; !known {
+					customs = append(customs, strings.ToUpper(strings.TrimPrefix(e, ".")))
+				}
+			}
+			if len(customs) > 0 {
+				customFormatEntry.SetText(strings.Join(customs, ","))
 			}
 		}
 		// 恢复命名选项
@@ -335,11 +436,28 @@ func main() {
 		if rel, err := filepath.Rel(src, dst); err == nil && rel != "." && !isRelOutside(rel) {
 			return core.Options{}, "目标文件夹不能在源文件夹内部,否则会递归处理已整理的结果!"
 		}
-		// 计算要处理的扩展名(全选 = 空切片 = 全部格式)
-		exts := collectExtensions(formatChecks)
-		// 若取消全部后一个格式都没选,提示用户至少勾选一种格式
-		if !formatAllChk.Checked && len(exts) == 0 {
-			return core.Options{}, "请至少勾选一种处理格式,或勾选『全部』"
+		// 计算要处理的扩展名
+		// formatAllChk 勾选 = 全部格式(空切片);否则收集勾选的预设格式 + 自定义格式
+		exts := []string(nil)
+		if !formatAllChk.Checked {
+			exts = collectExtensions(formatChecks)
+			// 解析自定义格式(逗号分隔,去掉多余空格与点)
+			for _, part := range strings.Split(customFormatEntry.Text, ",") {
+				p := strings.TrimSpace(part)
+				if p == "" {
+					continue
+				}
+				p = strings.TrimPrefix(strings.ToLower(p), ".")
+				e := "." + p
+				if _, known := formatChecks[e]; known {
+					continue // 已在预设格式中,跳过
+				}
+				exts = append(exts, e)
+			}
+			// 若取消全部后一个格式都没选(含自定义为空),提示用户至少勾选一种
+			if len(exts) == 0 {
+				return core.Options{}, "请至少勾选一种处理格式,或勾选『全部格式』"
+			}
 		}
 		// 命名选项: 保留原始文件名 + 前缀/后缀
 		keepOriginal := keepNameChk.Checked
@@ -642,10 +760,13 @@ func main() {
 			container.NewBorder(nil, nil, widget.NewLabel("源文件夹:"), srcBtn, srcEntry),
 			container.NewBorder(nil, nil, widget.NewLabel("目标文件夹:"), dstBtn, dstEntry),
 			container.NewHBox(widget.NewLabel("目录结构:"), modeGroup),
-			container.NewHBox(widget.NewLabel("处理格式:"), formatAllChk, formatRow1),
-			formatRow2,
+			// 处理格式分组(参考图): 全部格式 / 全部图片+图片行 / 全部视频+视频行 / 其他格式
+			container.NewHBox(widget.NewLabel("处理格式:"), formatAllChk),
+			container.NewHBox(formatPhotoAllChk, photoRow),
+			container.NewHBox(formatVideoAllChk, videoRow),
+			container.NewBorder(nil, nil, widget.NewLabel("其他格式:"), nil, customFormatEntry),
 			container.NewHBox(advancedBtn), // 『高级选项』折叠开关
-			advancedContent,               // 高级区内容(默认隐藏,展开时才显示)
+			advancedContent,                // 高级区内容(默认隐藏,展开时才显示)
 			container.NewHBox(previewBtn, startBtn, cancelBtn, exportBtn),
 			progress,
 			scanProgress,
@@ -662,18 +783,8 @@ func isRelOutside(rel string) bool {
 	return rel == ".." || len(rel) >= 3 && rel[:3] == "../"
 }
 
-// collectExtensions 收集当前勾选的扩展名。若所有格式复选框都勾选,返回空切片(表示全部)。
+// collectExtensions 收集当前勾选的扩展名(不含自定义格式)。
 func collectExtensions(checks map[string]*widget.Check) []string {
-	var all bool = true
-	for _, c := range checks {
-		if !c.Checked {
-			all = false
-			break
-		}
-	}
-	if all {
-		return nil // 空 = 全部格式
-	}
 	var exts []string
 	for ext, c := range checks {
 		if c.Checked {
