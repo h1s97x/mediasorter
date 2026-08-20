@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -710,10 +709,6 @@ func main() {
 	}
 
 	// run 执行整理(预览或正式),统一驱动进度条/日志文件/状态。
-	// previewItems 收集预览(仅 DryRun)时源->目标映射,供树形预览窗口展示。
-	var previewMu sync.Mutex
-	previewItems := map[string][]previewItem{} // 按目标相对路径分组(键即相对路径)
-
 	run := func(opt core.Options, modeLabel string) {
 		setButtonsRunning(true)
 		atomic.StoreInt64(&totalFiles, 0)
@@ -723,21 +718,11 @@ func main() {
 		progress.Show()
 		progress.SetValue(0)
 		status.SetText("正在扫描…")
-		// 重置预览数据
-		previewMu.Lock()
-		previewItems = map[string][]previewItem{}
-		previewMu.Unlock()
 
 		// 创建可取消 context,注入 core.Run 以支持安全中断。
 		ctx, cancel := context.WithCancel(context.Background())
 		cancelFunc = cancel
 		opt.Ctx = ctx
-		opt.OnPreview = func(srcPath, relDstPath string) {
-			// 收集预览映射,供树形预览窗口使用。DryRun 串行执行,加锁双保险。
-			previewMu.Lock()
-			previewItems[relDstPath] = append(previewItems[relDstPath], previewItem{Src: srcPath, Rel: relDstPath})
-			previewMu.Unlock()
-		}
 		cancelBtn.SetText("取消")
 
 		// 准备日志文件: 放到目标目录的 logs/ 子目录下,带时间戳,避免覆盖历史。
@@ -822,10 +807,6 @@ func main() {
 					status.SetText(fmt.Sprintf("预览完成: 将处理 %d / %d 个, 去重 %d, 失败 %d, 跳过 %d",
 						res.Processed, total, res.Duplicates, res.Failed, res.Skipped))
 					status.SetText(status.Text + "\n以上是预览结果,未做任何复制/移动。确认无误后点『开始整理』正式执行。")
-					// 预览完成后弹出树形预览窗口(仅当有预览结果,避免弹空树)
-					if len(previewItems) > 0 {
-						showPreviewWindow(previewItems)
-					}
 				} else {
 					progress.SetValue(1)
 					status.SetText(fmt.Sprintf("完成: 处理 %d / %d 个, 去重 %d, 失败 %d, 跳过 %d",
@@ -1000,12 +981,6 @@ func collectExtensions(checks map[string]*widget.Check) []string {
 	return exts
 }
 
-// previewItem 预览树中的一个文件条目: 源路径 + 目标相对路径。
-type previewItem struct {
-	Src string // 源文件绝对路径
-	Rel string // 目标相对路径,如 "2026/08/IMG_20260817_104121_001.jpg"
-}
-
 // openInSystem 用系统默认程序打开文件/目录(跨平台)。
 func openInSystem(p string) error {
 	var cmd *exec.Cmd
@@ -1020,144 +995,3 @@ func openInSystem(p string) error {
 	return cmd.Start()
 }
 
-// showPreviewWindow 弹出树形预览窗口,按 年/月/日 目录树展示每个文件的源->目标映射。
-// items 按目标相对路径分组(值切片),键本身即相对路径。
-func showPreviewWindow(items map[string][]previewItem) {
-	// 展平所有条目并排序,保证树展示顺序稳定
-	type entry struct {
-		src string
-		rel string
-	}
-	var all []entry
-	for _, list := range items {
-		for _, it := range list {
-			all = append(all, entry{src: it.Src, rel: it.Rel})
-		}
-	}
-	sort.Slice(all, func(i, j int) bool { return all[i].rel < all[j].rel })
-
-	// 构建完整树: 节点ID = 相对路径或它的目录前缀
-	children := map[string][]string{} // 节点ID -> 子节点ID
-	isBranch := map[string]bool{}     // 节点ID -> 是否为目录分支
-	leafSrc := map[string]string{}    // 叶子节点ID -> 源路径
-	var roots []string
-
-	addNode := func(id string, branch bool, src string) {
-		if _, seen := children[id]; seen {
-			// 已存在节点: 若本次要求作为分支而先前被当作叶子,需升级为分支
-			// (防止「同名文件 + 同名目录」时目录下的文件在树中丢失),并清理叶子源路径。
-			if branch && !isBranch[id] {
-				isBranch[id] = true
-				delete(leafSrc, id)
-			}
-			return
-		}
-		children[id] = []string{}
-		isBranch[id] = branch
-		if !branch {
-			leafSrc[id] = src
-		}
-	}
-
-	// 递归把相对路径拆成目录层级
-	for _, e := range all {
-		// 统一用 "/" 分隔,跨平台一致
-		parts := strings.Split(strings.ReplaceAll(e.rel, "\\", "/"), "/")
-		var cur string
-		for i, p := range parts {
-			if i == 0 {
-				cur = p
-			} else {
-				cur = cur + "/" + p
-			}
-			branch := i < len(parts)-1
-			addNode(cur, branch, "")
-			if i == 0 {
-				// 根节点
-				if !containsStr(roots, cur) {
-					roots = append(roots, cur)
-				}
-			} else {
-				parent := strings.TrimSuffix(cur, "/"+p)
-				if !containsStr(children[parent], cur) {
-					children[parent] = append(children[parent], cur)
-				}
-			}
-		}
-		// 叶子节点绑定源路径(若该路径已被识别为分支则跳过,保持分支语义)
-		if !isBranch[cur] {
-			leafSrc[cur] = e.src
-		}
-	}
-
-	// 树组件
-	tree := widget.NewTree(
-		func(id widget.TreeNodeID) []widget.TreeNodeID {
-			if id == "" {
-				return roots
-			}
-			return children[id]
-		},
-		func(id widget.TreeNodeID) bool {
-			return isBranch[id]
-		},
-		func(branch bool) fyne.CanvasObject {
-			if branch {
-				return widget.NewLabel("folder/")
-			}
-			return widget.NewLabel("file.ext")
-		},
-		func(id widget.TreeNodeID, branch bool, node fyne.CanvasObject) {
-			lbl := node.(*widget.Label)
-			base := id
-			if idx := strings.LastIndex(id, "/"); idx >= 0 {
-				base = id[idx+1:]
-			}
-			// 注意: 不使用 emoji(📁) 或特殊箭头(←)等非 ASCII 字形,
-			// 它们在部分系统(尤其 Windows 默认字体)上会渲染成乱码/黑块。
-			if branch {
-				lbl.SetText("[+] " + base)
-			} else {
-				src := leafSrc[id]
-				if src != "" {
-					lbl.SetText(base + "   <-  " + filepath.Base(src))
-				} else {
-					lbl.SetText(base)
-				}
-			}
-		},
-	)
-
-	// 统计面板(用 ASCII 箭头,避免乱码)
-	stat := widget.NewLabel(fmt.Sprintf("预览共 %d 个文件将按时间整理到目标目录\n(点击分支可折叠/展开,文件名后 '<-' 为源文件名)", len(all)))
-	stat.Wrapping = fyne.TextWrapWord
-
-	pw := fyne.CurrentApp().NewWindow("预览结果 - 整理后目录结构")
-	pw.Resize(fyne.NewSize(760, 560))
-	pw.SetContent(container.NewBorder(
-		container.NewVBox(stat, widget.NewSeparator()),
-		nil, nil, nil,
-		container.NewVScroll(tree),
-	))
-	pw.Show()
-
-	// 关键修复: 必须在窗口完成首次布局之后再展开所有分支。
-	// Fyne 的 Tree 采用惰性加载,若在显示前调用 OpenAllBranches(),
-	// 此时分支尚未被加载器发现,展开会落空,导致树形区域一片空白。
-	// 通过 fyne.Do 把展开动作放到下一轮 UI 事件循环执行,
-	// 确保树已完成布局、根节点已被发现后再递归展开。
-	fyne.Do(func() {
-		tree.OpenAllBranches()
-		tree.Refresh()
-	})
-}
-
-// containsStr 判断字符串切片是否包含指定元素。
-func containsStr(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
-}
