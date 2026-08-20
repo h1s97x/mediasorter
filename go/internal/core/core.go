@@ -27,10 +27,38 @@ type Options struct {
 	Offset int    // 时间偏移(秒),修正机内时间差
 	Year   bool   // true=仅按年; Day=true=年/月/日; 默认 年/月
 	Day    bool
+	// DirLayout 目标目录结构模板,支持 Go 时间布局符(2006=年, 01=月, 02=日)
+	// 与分隔符 '/' 组合,例如:
+	//   "2006"            -> YYYY/
+	//   "2006/01"         -> YYYY/MM/
+	//   "2006/01/02"      -> YYYY/MM/DD/
+	//   "2006/2006-01"    -> YYYY/YYYY-MM/
+	//   "2006/2006-01-02" -> YYYY/YYYY-MM-DD/
+	//   "2006/2006-01/2006-01-02" -> YYYY/YYYY-MM/YYYY-MM-DD/
+	//   "2006-01"         -> YYYY-MM/
+	//   "2006-01-02"      -> YYYY-MM-DD/
+	//   "{dir}"           -> Original-Directory-Name/(按源目录名分组)
+	// 空串时回退到旧 Year/Day 语义(默认 年/月)。
+	DirLayout string
 	// Extensions 要处理的扩展名白名单(含点,小写,如 ".jpg");为空表示处理全部支持的媒体格式。
 	Extensions []string
 	// KeepOriginal true=保留原始文件名(仍会加入前缀/后缀,冲突时追加序号), false=使用规范的 YYYY-MM-DD_HHMMSS_NNN 命名。
+	// 已被 NameLayout 取代(空模板时仍回退到该旧语义)。
 	KeepOriginal bool
+	// NameLayout 目标文件名模板,支持占位符:
+	//   {ts}   -> 完整时间戳 YYYY-MM-DD_HHMMSS
+	//   {date} -> 日期 YYYY-MM-DD
+	//   {orig} -> 原始文件名(不含扩展名)
+	//   {seq}  -> 3 位序号后缀(如 _001)。模板含 {seq} 时每个文件都会带序号,
+	//              保证文件名唯一;不含 {seq} 时仅在同名冲突时由冲突策略追加序号。
+	// 示例(对应参考图 Separator 下拉的 5 种):
+	//   "{ts}{seq}"      -> YYYY-MM-DD_HHMMSS_XXX(始终带序号)
+	//   "{ts}"           -> YYYY-MM-DD_HHMMSS
+	//   "{ts} {orig}"    -> YYYY-MM-DD_HHMMSS Original-Filename
+	//   "{date}_{orig}"  -> YYYY-MM-DD_Original-Filename
+	//   "{orig}"         -> Original-Filename
+	// 空串时回退到旧 KeepOriginal 语义(KeepOriginal=true 用 {orig},否则用 {ts})。
+	NameLayout string
 	// NamePrefix 追加到文件名开头的自定义文本(如 "旅行_")。
 	NamePrefix string
 	// NameSuffix 追加到扩展名之前的自定义文本(如 "_已整理")。
@@ -77,7 +105,7 @@ type Result struct {
 	Processed   int
 	Duplicates  int
 	Failed      int
-	Skipped     int // 因同名冲突而按"跳过"策略跳过的文件数
+	Skipped     int  // 因同名冲突而按"跳过"策略跳过的文件数
 	Cancelled   bool // true 表示运行因取消而提前终止(仍可能已处理部分文件)
 	TimeSpanMin time.Time
 	TimeSpanMax time.Time
@@ -339,7 +367,7 @@ func Run(opt Options, log func(string)) Result {
 
 		base := baseName(f, t, opt) // 不含扩展名
 		ext := strings.ToLower(filepath.Ext(f))
-		sub := relDir(t, opt)
+		sub := relDir(f, t, opt)
 		// 按冲突策略决定目标文件名(锁内完成命名与存在性判断,确保并发下一致)。
 		conflict := opt.OnConflict
 		if conflict == "" {
@@ -349,11 +377,13 @@ func Run(opt Options, log func(string)) Result {
 		var target string
 		if conflict == "skip" {
 			// 跳过策略: 目标已存在或本批次已有同名文件被处理过,则跳过该文件。
-			newName = base + ext
+			// 模板含 {seq} 时跳过策略忽略序号占位符(只保留首个)。
+			baseNoSeq := strings.ReplaceAll(base, "{seq}", "")
+			newName = baseNoSeq + ext
 			target = filepath.Join(opt.Dst, sub, newName)
 			// 冲突键需结合子目录维度,避免 KeepOriginal 下跨目录同名(拍摄日期不同,
 			// 归档到不同 sub 子目录)被误判为"本批次已处理"而误跳过。
-			conflictKey := sub + "/" + base
+			conflictKey := sub + "/" + baseNoSeq
 			if counter[conflictKey] > 0 {
 				// 本批次已处理过同子目录同名文件(skip 语义:只保留第一个)
 				emit("[跳过] 同名文件已被处理,跳过: " + f)
@@ -377,27 +407,70 @@ func Run(opt Options, log func(string)) Result {
 			counter[conflictKey] = 1
 			mu.Unlock()
 		} else if conflict == "overwrite" {
-			// 覆盖策略: 固定文件名,目标已存在则覆盖(危险)。
-			newName = base + ext
+			// 覆盖策略: 固定文件名,目标已存在则覆盖(危险)。忽略 {seq} 占位符。
+			newName = strings.ReplaceAll(base, "{seq}", "") + ext
 			target = filepath.Join(opt.Dst, sub, newName)
 			counter[base] = 1
 			mu.Unlock()
 		} else {
 			// sequence 策略(默认): 递增序号,绝不覆盖。在锁内完成序号保留,确保并发下不重名。
-			counter[base]++
-			seq := counter[base]
-			newName = fmt.Sprintf("%s_%03d%s", base, seq, ext)
-			target = filepath.Join(opt.Dst, sub, newName)
-			guard := 0
-			for _, err := os.Stat(target); err == nil && guard < 999; _, err = os.Stat(target) {
-				seq++
+			if strings.Contains(base, "{seq}") {
+				// 模板含 {seq}: 每个文件都带序号(保证唯一),序号插入到 {seq} 占位符处。
+				counter[base]++
+				seq := counter[base]
+				newName = strings.ReplaceAll(base, "{seq}", fmt.Sprintf("_%03d", seq)) + ext
+				target = filepath.Join(opt.Dst, sub, newName)
+				guard := 0
+				for _, err := os.Stat(target); err == nil && guard < 999; _, err = os.Stat(target) {
+					seq++
+					newName = strings.ReplaceAll(base, "{seq}", fmt.Sprintf("_%03d", seq)) + ext
+					target = filepath.Join(opt.Dst, sub, newName)
+					guard++
+				}
+				counter[base] = seq
+			} else if opt.NameLayout != "" {
+				// 显式模板且不含 {seq}: 优先使用不带序号的基础名(如 {orig} 保持原始名、{ts} 用纯时间戳)。
+				// 仅当磁盘已存在同名,或本批次已处理过同名文件时,才追加递增序号避免覆盖。
+				plain := base + ext
+				target = filepath.Join(opt.Dst, sub, plain)
+				if _, err := os.Stat(target); err != nil && counter[base] == 0 {
+					// 目标不存在且本批次未处理过同名: 直接用无序号文件名,与预设语义一致。
+					newName = plain
+					counter[base] = 1
+				} else {
+					// 发生冲突(磁盘已存在或本批次已处理过同名): 递增序号。
+					counter[base]++
+					seq := counter[base]
+					newName = fmt.Sprintf("%s_%03d%s", base, seq, ext)
+					target = filepath.Join(opt.Dst, sub, newName)
+					guard := 0
+					for _, err := os.Stat(target); err == nil && guard < 999; _, err = os.Stat(target) {
+						seq++
+						newName = fmt.Sprintf("%s_%03d%s", base, seq, ext)
+						target = filepath.Join(opt.Dst, sub, newName)
+						guard++
+					}
+					// 关键: 将最终保留的序号回写 counter,保证后续 counter 分配从当前磁盘已用序号继续,
+					// 避免并发下另一 worker 分配到与本次已保留 target 相同的 seq 而相互覆盖。
+					counter[base] = seq
+				}
+			} else {
+				// 旧兼容路径(NameLayout 为空): 保持旧行为,始终追加递增序号。
+				counter[base]++
+				seq := counter[base]
 				newName = fmt.Sprintf("%s_%03d%s", base, seq, ext)
 				target = filepath.Join(opt.Dst, sub, newName)
-				guard++
+				guard := 0
+				for _, err := os.Stat(target); err == nil && guard < 999; _, err = os.Stat(target) {
+					seq++
+					newName = fmt.Sprintf("%s_%03d%s", base, seq, ext)
+					target = filepath.Join(opt.Dst, sub, newName)
+					guard++
+				}
+				// 关键: 将最终保留的序号回写 counter,保证后续 counter 分配从当前磁盘已用序号继续,
+				// 避免并发下另一 worker 分配到与本次已保留 target 相同的 seq 而相互覆盖。
+				counter[base] = seq
 			}
-			// 关键: 将最终保留的序号回写 counter,保证后续 counter 分配从当前磁盘已用序号继续,
-			// 避免并发下另一 worker 分配到与本次已保留 target 相同的 seq 而相互覆盖。
-			counter[base] = seq
 			mu.Unlock()
 		}
 
@@ -571,7 +644,12 @@ func copyFile(src, dst string, ctx context.Context) error {
 	return nil
 }
 
-func relDir(t time.Time, opt Options) string {
+func relDir(f string, t time.Time, opt Options) string {
+	// 优先使用新的 DirLayout 模板
+	if opt.DirLayout != "" {
+		return expandLayout(f, opt.Src, t, opt.DirLayout)
+	}
+	// 兼容旧参数
 	switch {
 	case opt.Year:
 		return t.Format("2006")
@@ -582,14 +660,54 @@ func relDir(t time.Time, opt Options) string {
 	}
 }
 
+// expandLayout 将目录结构模板展开为实际相对路径。
+// 时间布局符用 Go 布局(2006/01/02),'{dir}' 占位符展开为源文件所在目录名,
+// '{flat}' 表示根目录平铺(返回空路径,文件直接放目标根)。
+// 当源文件直接位于源根目录时,{dir} 无子目录名可循,按平铺处理(空路径)。
+func expandLayout(f, src string, t time.Time, layout string) string {
+	if layout == "{flat}" {
+		return "" // 根目录平铺
+	}
+	// 先做时间格式化(未知的 {dir} 会作为字面量保留),再替换目录名占位符
+	dirName := ""
+	if strings.Contains(layout, "{dir}") {
+		// 取源文件所在目录相对源根的父目录名;文件直接在源根时为空(平铺)。
+		rel, err := filepath.Rel(src, filepath.Dir(f))
+		if err == nil && rel != "." && rel != "" {
+			dirName = filepath.Base(rel)
+		}
+	}
+	result := strings.ReplaceAll(t.Format(layout), "{dir}", dirName)
+	// 当 {dir} 展开为空时(源文件在源根),清理多余分隔符;
+	// 若结果为 '.' 或空,视为平铺(空路径)。
+	if strings.Contains(layout, "{dir}") {
+		result = strings.TrimLeft(filepath.Clean(result), string(filepath.Separator))
+		if result == "." || result == "" {
+			return ""
+		}
+	}
+	return result
+}
+
 // baseName 生成目标文件的基础名(不含扩展名与冲突序号)。
 // 默认用规范时间名 YYYY-MM-DD_HHMMSS;KeepOriginal 时用原始文件名;
 // 前缀/后缀会追加在基础名两侧(后缀在扩展名之前)。
 func baseName(f string, t time.Time, opt Options) string {
-	coreName := t.Format("2006-01-02_150405")
-	if opt.KeepOriginal {
-		coreName = strings.TrimSuffix(filepath.Base(f), filepath.Ext(f))
+	layout := opt.NameLayout
+	if layout == "" {
+		// 空模板: 回退旧语义
+		if opt.KeepOriginal {
+			layout = "{orig}"
+		} else {
+			layout = "{ts}"
+		}
 	}
+	orig := strings.TrimSuffix(filepath.Base(f), filepath.Ext(f))
+	coreName := layout
+	coreName = strings.ReplaceAll(coreName, "{orig}", orig)
+	coreName = strings.ReplaceAll(coreName, "{ts}", t.Format("2006-01-02_150405"))
+	coreName = strings.ReplaceAll(coreName, "{date}", t.Format("2006-01-02"))
+	// 注意: {seq} 占位符保留不动,由冲突逻辑统一替换(模板含它则始终带序号)。
 	return opt.NamePrefix + coreName + opt.NameSuffix
 }
 

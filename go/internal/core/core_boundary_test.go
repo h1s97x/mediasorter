@@ -66,7 +66,7 @@ func TestIsMedia_WithExtWhitelist(t *testing.T) {
 func TestRelDir_YearMonth(t *testing.T) {
 	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
 	opt := Options{} // 默认 年/月
-	if got := relDir(tm, opt); got != filepath.Join("2025", "06") {
+	if got := relDir("/x/a.jpg", tm, opt); got != filepath.Join("2025", "06") {
 		t.Errorf("年/月 期望 2025/06,实际 %q", got)
 	}
 }
@@ -74,16 +74,112 @@ func TestRelDir_YearMonth(t *testing.T) {
 func TestRelDir_YearOnly(t *testing.T) {
 	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
 	opt := Options{Year: true}
-	if got := relDir(tm, opt); got != "2025" {
+	if got := relDir("/x/a.jpg", tm, opt); got != "2025" {
 		t.Errorf("仅年 期望 2025,实际 %q", got)
+	}
+}
+
+func TestRelDir_YearOnlyDirLayout(t *testing.T) {
+	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
+	opt := Options{DirLayout: "2006"}
+	if got := relDir("/x/a.jpg", tm, opt); got != "2025" {
+		t.Errorf("DirLayout 仅年 期望 2025,实际 %q", got)
 	}
 }
 
 func TestRelDir_YearMonthDay(t *testing.T) {
 	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
 	opt := Options{Day: true}
-	if got := relDir(tm, opt); got != filepath.Join("2025", "06", "15") {
+	if got := relDir("/x/a.jpg", tm, opt); got != filepath.Join("2025", "06", "15") {
 		t.Errorf("年/月/日 期望 2025/06/15,实际 %q", got)
+	}
+}
+
+func TestRelDir_DirLayoutYearMonth(t *testing.T) {
+	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
+	opt := Options{DirLayout: "2006/01"}
+	if got := relDir("/x/a.jpg", tm, opt); got != filepath.Join("2025", "06") {
+		t.Errorf("年/月 期望 2025/06,实际 %q", got)
+	}
+}
+
+func TestRelDir_DirLayoutYearMonthDay(t *testing.T) {
+	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
+	opt := Options{DirLayout: "2006/01/02"}
+	if got := relDir("/x/a.jpg", tm, opt); got != filepath.Join("2025", "06", "15") {
+		t.Errorf("年/月/日 期望 2025/06/15,实际 %q", got)
+	}
+}
+
+func TestRelDir_DirLayoutYearMonthTag(t *testing.T) {
+	// YYYY/YYYY-MM 结构
+	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
+	opt := Options{DirLayout: "2006/2006-01"}
+	if got := relDir("/x/a.jpg", tm, opt); got != filepath.Join("2025", "2025-06") {
+		t.Errorf("年/年月 期望 2025/2025-06,实际 %q", got)
+	}
+}
+
+func TestRelDir_DirLayoutYearMonthDayTag(t *testing.T) {
+	// YYYY/YYYY-MM-DD 结构
+	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
+	opt := Options{DirLayout: "2006/2006-01-02"}
+	if got := relDir("/x/a.jpg", tm, opt); got != filepath.Join("2025", "2025-06-15") {
+		t.Errorf("年/年月日 期望 2025/2025-06-15,实际 %q", got)
+	}
+}
+
+func TestRelDir_DirLayoutYearMonthMonthDayTag(t *testing.T) {
+	// YYYY/YYYY-MM/YYYY-MM-DD 结构
+	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
+	opt := Options{DirLayout: "2006/2006-01/2006-01-02"}
+	if got := relDir("/x/a.jpg", tm, opt); got != filepath.Join("2025", "2025-06", "2025-06-15") {
+		t.Errorf("年/年月/年月日 期望 2025/2025-06/2025-06-15,实际 %q", got)
+	}
+}
+
+func TestRelDir_DirLayoutYearMonthTagFlat(t *testing.T) {
+	// YYYY-MM 结构
+	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
+	opt := Options{DirLayout: "2006-01"}
+	if got := relDir("/x/a.jpg", tm, opt); got != "2025-06" {
+		t.Errorf("年月 期望 2025-06,实际 %q", got)
+	}
+}
+
+func TestRelDir_DirLayoutYearMonthDayTagFlat(t *testing.T) {
+	// YYYY-MM-DD 结构
+	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
+	opt := Options{DirLayout: "2006-01-02"}
+	if got := relDir("/x/a.jpg", tm, opt); got != "2025-06-15" {
+		t.Errorf("年月日 期望 2025-06-15,实际 %q", got)
+	}
+}
+
+func TestRelDir_DirLayoutDirPlaceholder(t *testing.T) {
+	// {dir} 按源目录名分组(文件位于源根的下一级子目录)
+	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
+	opt := Options{Src: "/photo", DirLayout: "{dir}/2006"}
+	if got := relDir("/photo/album1/a.jpg", tm, opt); got != filepath.Join("album1", "2025") {
+		t.Errorf("按目录名分组 期望 album1/2025,实际 %q", got)
+	}
+}
+
+func TestRelDir_DirLayoutDirAtSourceRoot(t *testing.T) {
+	// 源文件直接位于源根目录时,{dir} 无子目录名可循,按平铺处理(空路径)
+	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
+	opt := Options{Src: "/photo", DirLayout: "{dir}/2006"}
+	if got := relDir("/photo/a.jpg", tm, opt); got != "2025" {
+		t.Errorf("源根目录 {dir} 应按平铺处理,期望 2025,实际 %q", got)
+	}
+}
+
+func TestRelDir_DirLayoutFlat(t *testing.T) {
+	// {flat} 根目录平铺,返回空路径
+	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
+	opt := Options{DirLayout: "{flat}"}
+	if got := relDir("/x/a.jpg", tm, opt); got != "" {
+		t.Errorf("根目录平铺 期望空路径,实际 %q", got)
 	}
 }
 
@@ -91,7 +187,7 @@ func TestRelDir_YearWinsOverDay(t *testing.T) {
 	// Year 优先于 Day(代码 switch 先判 Year)
 	tm := time.Date(2025, 6, 15, 12, 0, 0, 0, time.Local)
 	opt := Options{Year: true, Day: true}
-	if got := relDir(tm, opt); got != "2025" {
+	if got := relDir("/x/a.jpg", tm, opt); got != "2025" {
 		t.Errorf("Year 应优先,期望 2025,实际 %q", got)
 	}
 }
@@ -100,7 +196,7 @@ func TestRelDir_EmptyTime(t *testing.T) {
 	// 零值时间也是合法 time.Time,format 出 0001/01
 	var tm time.Time
 	opt := Options{}
-	if got := relDir(tm, opt); got != filepath.Join("0001", "01") {
+	if got := relDir("/x/a.jpg", tm, opt); got != filepath.Join("0001", "01") {
 		t.Errorf("零值时间期望 0001/01,实际 %q", got)
 	}
 }

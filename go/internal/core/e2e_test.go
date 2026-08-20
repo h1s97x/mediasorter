@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -228,5 +229,70 @@ func TestE2E_LogCallback(t *testing.T) {
 	}
 	if len(logs) == 0 {
 		t.Error("log 回调应被调用")
+	}
+}
+
+// TestE2E_DirLayoutStructures 验证多种目录结构模板(DirLayout)实际落盘目录正确。
+// 覆盖参考图的几类典型结构: 根目录平铺 / YYYY-YYYY-MM / 按原目录名。
+func TestE2E_DirLayoutStructures(t *testing.T) {
+	cases := []struct {
+		name      string
+		layout    string
+		expectRel string // 期望的目标相对路径(不含文件名)
+		flatTop   bool   // 根目录平铺(文件直接放 dst 根)
+	}{
+		{"根目录平铺(带时间戳文件名)", "{flat}", "", true},
+		{"YYYY/YYYY-MM", "2006/2006-01", "2023/2023-03", false},
+		{"YYYY/YYYY-MM/YYYY-MM-DD", "2006/2006-01/2006-01-02", "2023/2023-03/2023-03-15", false},
+		{"YYYY-MM-DD", "2006-01-02", "2023-03-15", false},
+		{"按原目录名", "{dir}", "album", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := t.TempDir()
+			dst := t.TempDir()
+			// 照片放在 album 子目录,验证 {dir} 取源目录名
+			album := filepath.Join(src, "album")
+			if err := os.MkdirAll(album, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(album, "photo.jpg"),
+				makeJpgWithExif("2023:03:15 10:30:00"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			opt := Options{Src: src, Dst: dst, Dedupe: true, DirLayout: tc.layout}
+			res := Run(opt, func(s string) {})
+			if res.Processed != 1 {
+				t.Fatalf("期望处理 1,实际 %d", res.Processed)
+			}
+
+			if tc.flatTop {
+				// 平铺: 文件直接在 dst 根目录,且命名带时间戳
+				entries, err := os.ReadDir(dst)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(entries) != 1 {
+					t.Fatalf("根目录应只有 1 个文件,实际 %d 个", len(entries))
+				}
+				if !strings.HasPrefix(entries[0].Name(), "2023-03-15_") {
+					t.Errorf("平铺文件名应带时间戳前缀,实际 %q", entries[0].Name())
+				}
+				return
+			}
+
+			full := filepath.Join(append([]string{dst}, strings.Split(tc.expectRel, "/")...)...)
+			fi, err := os.Stat(full)
+			if err != nil || !fi.IsDir() {
+				t.Errorf("期望目录 %q 存在,错误=%v", full, err)
+			}
+			// 目录内应有整理后的文件
+			sub, err := os.ReadDir(full)
+			if err != nil || len(sub) != 1 {
+				t.Errorf("期望目录内有 1 个文件,实际 len=%d err=%v", len(sub), err)
+			}
+		})
 	}
 }

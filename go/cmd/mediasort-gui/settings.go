@@ -15,17 +15,19 @@ import (
 type settings struct {
 	Src          string   `json:"src"`
 	Dst          string   `json:"dst"`
-	Mode         string   `json:"mode"` // "y" | "ym" | "ymd"
+	Mode         string   `json:"mode"`                 // "y" | "ym" | "ymd" | 兼容旧值
+	DirLayout    string   `json:"dir_layout,omitempty"` // 目录结构模板(参考图),空=用 Mode 旧语义
 	Move         bool     `json:"move"`
 	Dedupe       bool     `json:"dedupe"`
 	Offset       int      `json:"offset"`
 	Extensions   []string `json:"extensions,omitempty"` // 空 = 全部格式
 	KeepOriginal bool     `json:"keep_original,omitempty"`
+	NameLayout   string   `json:"name_layout,omitempty"` // 文件名模板(参考图 Separator),空=用 KeepOriginal 旧语义
 	NamePrefix   string   `json:"name_prefix,omitempty"`
 	NameSuffix   string   `json:"name_suffix,omitempty"`
 	TimeFilter   string   `json:"time_filter,omitempty"` // "" | "has" | "none"
-	OnConflict   string   `json:"on_conflict,omitempty"`   // "sequence" | "skip" | "overwrite"
-	StrictTime   bool     `json:"strict_time,omitempty"`   // 严格时间模式
+	OnConflict   string   `json:"on_conflict,omitempty"` // "sequence" | "skip" | "overwrite"
+	StrictTime   bool     `json:"strict_time,omitempty"` // 严格时间模式
 }
 
 // settingsPath 返回配置文件路径,并确保其所在目录存在

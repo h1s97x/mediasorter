@@ -12,6 +12,17 @@
 //	--offset N    时间偏移 N 秒(修正机内时间)
 //	--year        仅按年分目录
 //	--day         按 年/月/日 分目录
+//	--layout=模板 自定义目录结构(优先级高于 --year/--day)。示例:
+//	              YYYY / 2006
+//	              YYYY/MM/DD / 2006/01/02
+//	              YYYY/YYYY-MM / 2006/2006-01
+//	              YYYY-MM-DD / 2006-01-02
+//	              按原目录名 / {dir}
+//	--name=模板  自定义文件名格式(优先级高于 --keep-original)。占位符:
+//	              {ts}=YYYY-MM-DD_HHMMSS {date}=YYYY-MM-DD
+//	              {orig}=原始文件名 {seq}=序号(_001,含它则始终带序号)
+//	              例如: --name='{date}_{orig}'
+//	--keep-original 保留原始文件名(等价于 --name='{orig}')
 //	--jobs N      并发 worker 数(默认 CPU 核数;=1 串行)
 //	--strict-time 严格时间模式(只认 EXIF/元数据,不把文件名/文件时间当拍摄时间)
 //	--conflict=策略 同名文件处理: sequence(默认加序号) | skip | overwrite
@@ -54,6 +65,12 @@ func main() {
 			if v, err := strconv.Atoi(strings.TrimPrefix(a, "--offset=")); err == nil {
 				opt.Offset = v
 			}
+		case strings.HasPrefix(a, "--layout="):
+			opt.DirLayout = strings.TrimPrefix(a, "--layout=")
+		case strings.HasPrefix(a, "--name="):
+			opt.NameLayout = strings.TrimPrefix(a, "--name=")
+		case a == "--keep-original":
+			opt.KeepOriginal = true
 		case strings.HasPrefix(a, "--jobs="):
 			if v, err := strconv.Atoi(strings.TrimPrefix(a, "--jobs=")); err == nil && v > 0 {
 				opt.Concurrency = v
@@ -123,7 +140,7 @@ func printHelp() {
 	fmt.Println("用法一(最简单): 把照片文件夹拖到本程序图标上,松手")
 	fmt.Println("  结果生成在源文件夹的上一级目录『MediaSorter』,按 年/月 排好")
 	fmt.Println("用法二(命令行): mediasort <源文件夹> [目标文件夹] [选项]")
-	fmt.Println("  选项: --move | --no-dedupe | --dry-run | --offset=秒 | --year | --day | --jobs=并发数 | --strict-time | --conflict=策略")
+	fmt.Println("  选项: --move | --no-dedupe | --dry-run | --offset=秒 | --year | --day | --layout=模板 | --name=文件名模板 | --keep-original | --jobs=并发数 | --strict-time | --conflict=策略")
 }
 
 func waitExit() {

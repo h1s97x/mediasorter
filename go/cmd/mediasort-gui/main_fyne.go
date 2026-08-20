@@ -40,20 +40,39 @@ func main() {
 	dstEntry := widget.NewEntry()
 	dstEntry.SetPlaceHolder("目标文件夹(留空 = 源文件夹上一级『MediaSorter』)")
 
-	mode := "ym"
-	modeGroup := widget.NewRadioGroup([]string{"年/月", "仅年", "年/月/日"}, func(s string) {
-		if s != "" {
-			switch s {
-			case "仅年":
-				mode = "y"
-			case "年/月/日":
-				mode = "ymd"
-			default:
-				mode = "ym"
+	mode := "ym" // 目录结构模式,见 modeLayouts
+	// 目录结构预设: 显示名 -> 模式标识。参考参考图的多种结构选项。
+	// 值对应 core.Options.DirLayout 模板;"flat" 表示根目录平铺放文件。
+	modeLabels := []struct {
+		label, key, layout string
+	}{
+		{"根目录(文件名带时间戳)", "flat", "{flat}"},
+		{"YYYY /", "y", "2006"},
+		{"YYYY-MM /", "mm", "2006-01"},
+		{"YYYY/MM /", "ym", "2006/01"},
+		{"YYYY/YYYY-MM /", "y-mm", "2006/2006-01"},
+		{"YYYY/MM/DD /", "ymd", "2006/01/02"},
+		{"YYYY/YYYY-MM-DD /", "y-mmdd", "2006/2006-01-02"},
+		{"YYYY/YYYY-MM/YYYY-MM-DD /", "y-mm-mmdd", "2006/2006-01/2006-01-02"},
+		{"YYYY-MM-DD /", "mmdd", "2006-01-02"},
+		{"原目录名 /", "dir", "{dir}"},
+	}
+	modeLayout := map[string]string{}
+	modeLabelsSlice := make([]string, 0, len(modeLabels))
+	for _, m := range modeLabels {
+		modeLayout[m.key] = m.layout
+		modeLabelsSlice = append(modeLabelsSlice, m.label)
+	}
+	// 用紧凑下拉框选择目录结构,保持主窗口简洁(参考图是单选列表,下拉同样直观)
+	modeSelect := widget.NewSelect(modeLabelsSlice, func(label string) {
+		for _, m := range modeLabels {
+			if m.label == label {
+				mode = m.key
+				return
 			}
 		}
 	})
-	modeGroup.SetSelected("年/月")
+	modeSelect.SetSelected("YYYY/MM /")
 
 	// ============ 『高级选项』折叠区内容(默认收起) ============
 	// 危险/低频/进阶设置全部收进高级区,主界面只留高频安全项,降低误触风险。
@@ -101,8 +120,27 @@ func main() {
 		})
 	timeFilterSel.SetSelected("全部文件")
 
-	// 命名选项: 保留原始文件名 + 自定义前缀/后缀
-	keepNameChk := widget.NewCheck("保留原始文件名(默认按拍摄时间命名)", nil)
+	// 文件名格式(Separator)预设: 显示名 -> NameLayout 模板(对应参考图下拉 5 种)。
+	// 值对应 core.Options.NameLayout 模板占位符 {ts}/{date}/{orig}/{seq}。
+	nameLabels := []struct {
+		label, layout string
+	}{
+		{"YYYY-MM-DD_HHMMSS_XXX(始终带序号)", "{ts}{seq}"},
+		{"YYYY-MM-DD_HHMMSS", "{ts}"},
+		{"YYYY-MM-DD_HHMMSS Original-Filename", "{ts} {orig}"},
+		{"YYYY-MM-DD_Original-Filename", "{date}_{orig}"},
+		{"Original-Filename", "{orig}"},
+	}
+	nameLayoutOf := map[string]string{}
+	nameLabelsSlice := make([]string, 0, len(nameLabels))
+	for _, n := range nameLabels {
+		nameLayoutOf[n.label] = n.layout
+		nameLabelsSlice = append(nameLabelsSlice, n.label)
+	}
+	nameSelect := widget.NewSelect(nameLabelsSlice, func(label string) {
+		// 选择即生效(无需额外动作),实际模板在收集时读取
+	})
+	nameSelect.SetSelected("YYYY-MM-DD_HHMMSS")
 	prefixEntry := widget.NewEntry()
 	prefixEntry.SetPlaceHolder("如: 旅行_ → 旅行_2026-01-30_143105.jpg")
 	prefixEntry.SetText("")
@@ -285,7 +323,8 @@ func main() {
 		dedupeChk,
 		container.NewHBox(widget.NewLabel("时间偏移(秒):"), offsetEntry),
 		container.NewHBox(widget.NewLabel("处理日期:"), timeFilterSel),
-		keepNameChk,
+		// 文件名格式(Separator)下拉
+		container.NewHBox(widget.NewLabel("文件名格式:"), nameSelect),
 		// 命名选项说明
 		widget.NewLabel("文件名前后缀(加在文件名两侧,后缀位于扩展名之前):"),
 		container.NewBorder(nil, nil, widget.NewLabel("文件名前缀:"), nil, prefixEntry),
@@ -367,16 +406,48 @@ func main() {
 	if s := loadSettings(); s.Src != "" || s.Dst != "" {
 		srcEntry.SetText(s.Src)
 		dstEntry.SetText(s.Dst)
-		switch s.Mode {
+		// 恢复目录结构: 优先用新模板,否则回退旧 Mode 键值
+		dirLayoutKey := s.Mode
+		if s.DirLayout != "" {
+			// 根据保存的模板反查预设 key;找不到则仍用 Mode
+			for k, l := range modeLayout {
+				if l == s.DirLayout {
+					dirLayoutKey = k
+					break
+				}
+			}
+		}
+		switch dirLayoutKey {
+		case "flat":
+			mode = "flat"
+			modeSelect.SetSelected("根目录(文件名带时间戳)")
 		case "y":
 			mode = "y"
-			modeGroup.SetSelected("仅年")
+			modeSelect.SetSelected("YYYY /")
+		case "mm":
+			mode = "mm"
+			modeSelect.SetSelected("YYYY-MM /")
 		case "ymd":
 			mode = "ymd"
-			modeGroup.SetSelected("年/月/日")
+			modeSelect.SetSelected("YYYY/MM/DD /")
+		case "y-mm":
+			mode = "y-mm"
+			modeSelect.SetSelected("YYYY/YYYY-MM /")
+		case "y-mmdd":
+			mode = "y-mmdd"
+			modeSelect.SetSelected("YYYY/YYYY-MM-DD /")
+		case "y-mm-mmdd":
+			mode = "y-mm-mmdd"
+			modeSelect.SetSelected("YYYY/YYYY-MM/YYYY-MM-DD /")
+		case "mmdd":
+			mode = "mmdd"
+			modeSelect.SetSelected("YYYY-MM-DD /")
+		case "dir":
+			mode = "dir"
+			modeSelect.SetSelected("原目录名 /")
 		default:
 			mode = "ym"
-			modeGroup.SetSelected("年/月")
+			modeSelect.SetSelected("YYYY/MM /")
 		}
 		// 移动文件属危险操作,一律默认不勾选(默认只复制),即使上次保存过也不自动启用
 		dedupeChk.SetChecked(s.Dedupe)
@@ -409,8 +480,23 @@ func main() {
 				customFormatEntry.SetText(strings.Join(customs, ","))
 			}
 		}
-		// 恢复命名选项
-		keepNameChk.SetChecked(s.KeepOriginal)
+		// 恢复命名选项: 优先用新文件名模板,否则回退旧 KeepOriginal 语义
+		if s.NameLayout != "" {
+			// 根据保存的模板反查预设显示名;找不到则选默认
+			restored := ""
+			for _, n := range nameLabels {
+				if n.layout == s.NameLayout {
+					restored = n.label
+					break
+				}
+			}
+			if restored != "" {
+				nameSelect.SetSelected(restored)
+			}
+		}
+		if s.KeepOriginal {
+			nameSelect.SetSelected("Original-Filename")
+		}
 		prefixEntry.SetText(s.NamePrefix)
 		suffixEntry.SetText(s.NameSuffix)
 		// 恢复录制日期筛选
@@ -499,8 +585,11 @@ func main() {
 				return core.Options{}, "请至少勾选一种处理格式,或勾选『全部格式』"
 			}
 		}
-		// 命名选项: 保留原始文件名 + 前缀/后缀
-		keepOriginal := keepNameChk.Checked
+		// 命名选项: 文件名格式下拉 + 前缀/后缀
+		nameLayout := nameLayoutOf[nameSelect.Selected]
+		if nameLayout == "" {
+			nameLayout = "{ts}" // 兜底: 默认无序号,仅冲突时追加
+		}
 		prefix := prefixEntry.Text
 		suffix := suffixEntry.Text
 		// 同名文件冲突策略与严格时间模式
@@ -514,11 +603,13 @@ func main() {
 			Src:          srcEntry.Text,
 			Dst:          dstEntry.Text,
 			Mode:         mode,
+			DirLayout:    modeLayout[mode],
 			Move:         moveChk.Checked,
 			Dedupe:       dedupeChk.Checked,
 			Offset:       offset,
 			Extensions:   exts,
-			KeepOriginal: keepOriginal,
+			KeepOriginal: nameLayout == "{orig}",
+			NameLayout:   nameLayout,
 			NamePrefix:   prefix,
 			NameSuffix:   suffix,
 			TimeFilter:   timeFilter,
@@ -531,12 +622,14 @@ func main() {
 			Dedupe:       dedupeChk.Checked,
 			Offset:       offset,
 			Extensions:   exts,
-			KeepOriginal: keepOriginal,
+			KeepOriginal: nameLayout == "{orig}",
+			NameLayout:   nameLayout,
 			NamePrefix:   prefix,
 			NameSuffix:   suffix,
 			TimeFilter:   timeFilter,
 			OnConflict:   onConflict,
 			StrictTime:   strict,
+			DirLayout:    modeLayout[mode],
 			Year:         mode == "y",
 			Day:          mode == "ymd",
 			OnProgress: func(done, total int) {
@@ -856,8 +949,8 @@ func main() {
 			container.NewBorder(nil, nil, widget.NewLabel("① 选择要整理的照片/视频文件夹:"), srcBtn, srcEntry),
 			// ② 目标文件夹(可选)
 			container.NewBorder(nil, nil, widget.NewLabel("② 整理到(留空=源目录旁 MediaSorter):"), dstBtn, dstEntry),
-			// ③ 目录结构(保留单选,紧凑竖排) + 高级选项入口
-			container.NewHBox(widget.NewLabel("③ 目录结构:"), modeGroup, advancedBtn),
+			// ③ 目录结构(下拉选择,紧凑) + 高级选项入口
+			container.NewHBox(widget.NewLabel("③ 目录结构:"), modeSelect, advancedBtn),
 			advancedContent, // 高级区内容(默认隐藏,展开时才显示)
 			// 两个主按钮: 预览(次要)+开始整理(主按钮强调色)
 			container.NewHBox(previewBtn, startBtn, moreBtn),
@@ -924,9 +1017,9 @@ func showPreviewWindow(items map[string][]previewItem) {
 	sort.Slice(all, func(i, j int) bool { return all[i].rel < all[j].rel })
 
 	// 构建完整树: 节点ID = 相对路径或它的目录前缀
-	children := map[string][]string{}    // 节点ID -> 子节点ID
-	isBranch := map[string]bool{}        // 节点ID -> 是否为目录分支
-	leafSrc := map[string]string{}       // 叶子节点ID -> 源路径
+	children := map[string][]string{} // 节点ID -> 子节点ID
+	isBranch := map[string]bool{}     // 节点ID -> 是否为目录分支
+	leafSrc := map[string]string{}    // 叶子节点ID -> 源路径
 	var roots []string
 
 	addNode := func(id string, branch bool, src string) {

@@ -58,13 +58,19 @@ go test ./internal/core/
 ```
 GUI 版(mediasort-gui):
     把照片文件夹直接拖到窗口上(或点"选择"),主界面可配置:
-      - 目录结构: 年/月 | 仅年 | 年/月/日
+      - 目录结构: 下拉可选多种,参考常见整理工具:
+        根目录平铺(文件名带时间戳) / YYYY / YYYY-MM / YYYY/MM /
+        YYYY/YYYY-MM / YYYY/MM/DD / YYYY/YYYY-MM-DD /
+        YYYY/YYYY-MM/YYYY-MM-DD / YYYY-MM-DD / 原目录名
       - 处理格式: 全部 / 指定格式(JPG/HEIC/MP4 等)
     主界面保持精简,其余低频/进阶/危险设置全部收纳在『高级选项』(默认折叠):
       - 去重(默认开)
       - 时间偏移(秒)
       - 录制日期筛选: 全部 / 仅录制日期 / 仅无录制日期
-      - 命名: 规范时间名 / 保留原始文件名,可加前缀后缀
+      - 文件名格式(Separator 参考图):
+        YYYY-MM-DD_HHMMSS(默认) / YYYY-MM-DD_HHMMSS_XXX(始终带序号) /
+        YYYY-MM-DD_HHMMSS Original-Filename / YYYY-MM-DD_Original-Filename /
+        Original-Filename,可再加前缀后缀
       - 同名文件处理策略: 自动加序号(默认) / 跳过 / 覆盖
       - 严格时间模式: 只认 EXIF/元数据,不把文件名/文件时间当拍摄时间
       - ⚠ 移动文件(删除源文件): 危险操作,默认折叠且不勾选;勾选时需确认,开始整理前再二次确认
@@ -79,7 +85,26 @@ GUI 版(mediasort-gui):
     用法一: 把照片文件夹拖到 exe 图标上,松手
             结果生成在源文件夹上一级『MediaSorter』,按 年/月 排好
     用法二: mediasort <源文件夹> [目标文件夹] [选项]
-    选项: --move | --no-dedupe | --dry-run | --offset=秒 | --year | --day
+    选项: --move | --no-dedupe | --dry-run | --offset=秒 | --year | --day | --layout=模板 | --name=文件名模板 | --keep-original | --jobs=并发数 | --strict-time | --conflict=策略
+           --layout 自定义目录结构(优先级高于 --year/--day),时间布局用 Go 格式符:
+           2006=年 01=月 02=日,'{dir}'=按源目录名,示例:
+             --layout="2006"            -> YYYY/
+             --layout="2006/01"         -> YYYY/MM/
+             --layout="2006/01/02"      -> YYYY/MM/DD/
+             --layout="2006/2006-01"    -> YYYY/YYYY-MM/
+             --layout="2006/2006-01/2006-01-02" -> YYYY/YYYY-MM/YYYY-MM-DD/
+             --layout="2006-01"         -> YYYY-MM/
+             --layout="2006-01-02"      -> YYYY-MM-DD/
+             --layout="{dir}"           -> 按原目录名/
+             --layout="{flat}"          -> 根目录平铺(文件直接放目标根,带时间戳名)
+           --name 自定义文件名格式(优先级高于 --keep-original),占位符:
+             {ts}=YYYY-MM-DD_HHMMSS {date}=YYYY-MM-DD {orig}=原始文件名
+             {seq}=序号(_001,含它则每个文件始终带序号,保证唯一;不含则仅同名冲突时追加序号)
+             例如:
+             --name="{ts}"            -> YYYY-MM-DD_HHMMSS(冲突时追加序号)
+             --name="{ts}{seq}"       -> YYYY-MM-DD_HHMMSS_XXX(始终带序号)
+             --name="{date}_{orig}"   -> YYYY-MM-DD_Original-Filename
+             --name="{orig}"          -> Original-Filename(等价 --keep-original)
 ```
 
 ## 时间提取优先级(四级兜底)
