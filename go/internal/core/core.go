@@ -66,6 +66,10 @@ type Options struct {
 	// OnPhase 阶段回调,可空。phase 取值为 "scan" | "dedupe" | "process" | "done"。
 	// 便于 GUI/CLI 切换不同阶段的进度展示(如扫描用不确定进度条,处理用确定进度条)。
 	OnPhase func(phase string)
+	// OnPreview 预览(仅 DryRun)阶段回调,可空。每次处理一个文件时调用一次,
+	// 携带源文件绝对路径与目标相对路径(如 "2026/08/IMG_20260817.jpg"),
+	// 供 GUI 构建可视化的预览目录树。非 DryRun 或 DryRun 之外的复制/移动阶段不调用。
+	OnPreview func(srcPath, relDstPath string)
 }
 
 // Result 处理结果
@@ -471,6 +475,9 @@ func Run(opt Options, log func(string)) Result {
 		}
 		emit(fmt.Sprintf("%s[%s] %s -> %s", prefix, t.Format("2006-01-02 15:04:05"),
 			filepath.Base(f), filepath.Join(sub, newName)))
+		if opt.DryRun && opt.OnPreview != nil {
+			opt.OnPreview(f, filepath.Join(sub, newName))
+		}
 		res.Processed++
 		done++
 		progress()

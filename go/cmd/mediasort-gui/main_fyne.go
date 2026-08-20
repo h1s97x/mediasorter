@@ -11,9 +11,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -282,13 +286,38 @@ func main() {
 	)
 	advancedContent.Hide()
 
-	logEntry := widget.NewMultiLineEntry()
-	logEntry.Disable()
-	logEntry.SetPlaceHolder("运行日志会显示在这里")
-	// 日志区: 设置合理的最小尺寸 + 自动换行。
-	// 尺寸过小导致内容拥挤;不换行时超长路径会横向溢出,需左右滑动查看。
-	logEntry.SetMinSize(fyne.NewSize(760, 280))
-	logEntry.Wrapping = fyne.TextWrapWord
+	// 日志改为落盘到文件(带时间戳),UI 不再用大文本框刷屏,只保留状态条 + 打开日志按钮。
+	// currentLogPath 记录最近一次运行的日志文件路径,供「打开日志」按钮使用。
+	var currentLogPath string
+	var logMu sync.Mutex
+	var logFile *os.File
+	closeLogFile := func() {
+		logMu.Lock()
+		if logFile != nil {
+			logFile.Close()
+			logFile = nil
+		}
+		logMu.Unlock()
+	}
+	writeLog := func(line string) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		if logFile != nil {
+			fmt.Fprintln(logFile, line)
+		}
+	}
+	// 打开日志文件的按钮: 运行产生日志后启用,用系统默认编辑器打开。
+	openLogBtn := widget.NewButton("打开日志", nil)
+	openLogBtn.Disable()
+	openLogBtn.OnTapped = func() {
+		if currentLogPath == "" {
+			dialog.ShowInformation("提示", "暂无日志文件,先执行一次预览或整理。", w)
+			return
+		}
+		if err := openInSystem(currentLogPath); err != nil {
+			dialog.ShowError(err, w)
+		}
+	}
 
 	// 进度条 + 状态
 	// progress: 处理阶段的确定进度条; scanProgress: 扫描阶段的无限进度条(动画)
@@ -575,7 +604,11 @@ func main() {
 		}, w)
 	}
 
-	// run 执行整理(预览或正式),统一驱动进度条/日志/状态。
+	// run 执行整理(预览或正式),统一驱动进度条/日志文件/状态。
+	// previewItems 收集预览(仅 DryRun)时源->目标映射,供树形预览窗口展示。
+	var previewMu sync.Mutex
+	previewItems := map[string][]previewItem{} // 按目标相对路径分组(键即相对路径)
+
 	run := func(opt core.Options, modeLabel string) {
 		setButtonsRunning(true)
 		atomic.StoreInt64(&totalFiles, 0)
@@ -585,15 +618,43 @@ func main() {
 		progress.Show()
 		progress.SetValue(0)
 		status.SetText("正在扫描…")
-		logEntry.SetText("")
-		logEntry.Enable()
-		logEntry.SetText(fmt.Sprintf("模式: %s\n输入: %s\n输出: %s\n\n", modeLabel, opt.Src, opt.Dst))
+		// 重置预览数据
+		previewMu.Lock()
+		previewItems = map[string][]previewItem{}
+		previewMu.Unlock()
 
 		// 创建可取消 context,注入 core.Run 以支持安全中断。
 		ctx, cancel := context.WithCancel(context.Background())
 		cancelFunc = cancel
 		opt.Ctx = ctx
+		opt.OnPreview = func(srcPath, relDstPath string) {
+			// 收集预览映射,供树形预览窗口使用。DryRun 串行执行,加锁双保险。
+			previewMu.Lock()
+			previewItems[relDstPath] = append(previewItems[relDstPath], previewItem{Src: srcPath, Rel: relDstPath})
+			previewMu.Unlock()
+		}
 		cancelBtn.SetText("取消")
+
+		// 准备日志文件: 放到目标目录的 logs/ 子目录下,带时间戳,避免覆盖历史。
+		closeLogFile() // 关闭上一次未关闭的句柄
+		currentLogPath = ""
+		openLogBtn.Disable() // 新一轮运行重置日志路径,避免上一轮残留导致误弹"暂无日志文件"
+		logDir := filepath.Join(opt.Dst, "logs")
+		if err := os.MkdirAll(logDir, 0o755); err == nil {
+			lp := filepath.Join(logDir, fmt.Sprintf("mediasorter-%s.log", time.Now().Format("20060102-150405")))
+			if f, err := os.OpenFile(lp, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+				logMu.Lock()
+				logFile = f
+				logMu.Unlock()
+				currentLogPath = lp
+				// 头信息
+				writeLog(fmt.Sprintf("===== MediaSorter %s =====", modeLabel))
+				writeLog(fmt.Sprintf("时间: %s", time.Now().Format("2006-01-02 15:04:05")))
+				writeLog(fmt.Sprintf("输入: %s", opt.Src))
+				writeLog(fmt.Sprintf("输出: %s", opt.Dst))
+				writeLog("")
+			}
+		}
 
 		ch := make(chan string, 256)
 		doneCh := make(chan core.Result, 1)
@@ -607,9 +668,7 @@ func main() {
 				if r := recover(); r != nil {
 					res.Cancelled = false
 					res.Processed = -1 // 标记异常,供最终状态展示
-					fyne.Do(func() {
-						logEntry.SetText(logEntry.Text + fmt.Sprintf("\n[错误] 处理过程中发生异常,已中止: %v\n", r))
-					})
+					writeLog(fmt.Sprintf("\n[错误] 处理过程中发生异常,已中止: %v", r))
 				}
 				select {
 				case doneCh <- res:
@@ -623,11 +682,14 @@ func main() {
 		go func() {
 			for s := range ch {
 				msg := s
+				writeLog(msg) // 日志写入文件,不再刷到 UI
+				// 运行中在状态条显示最近一行日志,便于用户实时感知进度
 				fyne.Do(func() {
-					logEntry.SetText(logEntry.Text + msg + "\n")
+					status.SetText(msg)
 				})
 			}
 			res := <-doneCh
+			closeLogFile()
 			fyne.Do(func() {
 				total := atomic.LoadInt64(&totalFiles)
 				if total <= 0 {
@@ -639,7 +701,9 @@ func main() {
 					setButtonsRunning(false)
 					cancelFunc = nil
 					cancelBtn.SetText("取消")
-					logEntry.Disable()
+					if currentLogPath != "" {
+						openLogBtn.Enable()
+					}
 					return
 				}
 				if res.Cancelled {
@@ -653,6 +717,10 @@ func main() {
 					status.SetText(fmt.Sprintf("预览完成: 将处理 %d / %d 个, 去重 %d, 失败 %d, 跳过 %d",
 						res.Processed, total, res.Duplicates, res.Failed, res.Skipped))
 					status.SetText(status.Text + "\n以上是预览结果,未做任何复制/移动。确认无误后点『开始整理』正式执行。")
+					// 预览完成后弹出树形预览窗口(仅当有预览结果,避免弹空树)
+					if len(previewItems) > 0 {
+						showPreviewWindow(previewItems)
+					}
 				} else {
 					progress.SetValue(1)
 					status.SetText(fmt.Sprintf("完成: 处理 %d / %d 个, 去重 %d, 失败 %d, 跳过 %d",
@@ -677,7 +745,9 @@ func main() {
 				setButtonsRunning(false)
 				cancelFunc = nil
 				cancelBtn.SetText("取消")
-				logEntry.Disable() // 运行结束,禁止编辑日志区
+				if currentLogPath != "" {
+					openLogBtn.Enable()
+				}
 			})
 		}()
 	}
@@ -752,9 +822,7 @@ func main() {
 		}
 	})
 
-	// 日志区: 独立固定高度,避免被挤压成一行
-	logBox := container.NewVBox(widget.NewLabel("日志:"), logEntry)
-	// 用 Scroll 包裹日志区内容,确保高度可控
+	// 底部布局: 按钮行(含打开日志)、进度条、状态。日志已改为落盘,不再占用界面空间。
 	content := container.NewVScroll(
 		container.NewVBox(
 			container.NewBorder(nil, nil, widget.NewLabel("源文件夹:"), srcBtn, srcEntry),
@@ -767,11 +835,10 @@ func main() {
 			container.NewBorder(nil, nil, widget.NewLabel("其他格式:"), nil, customFormatEntry),
 			container.NewHBox(advancedBtn), // 『高级选项』折叠开关
 			advancedContent,                // 高级区内容(默认隐藏,展开时才显示)
-			container.NewHBox(previewBtn, startBtn, cancelBtn, exportBtn),
+			container.NewHBox(previewBtn, startBtn, cancelBtn, exportBtn, openLogBtn),
 			progress,
 			scanProgress,
 			status,
-			logBox,
 		),
 	)
 	w.SetContent(content)
@@ -792,4 +859,155 @@ func collectExtensions(checks map[string]*widget.Check) []string {
 		}
 	}
 	return exts
+}
+
+// previewItem 预览树中的一个文件条目: 源路径 + 目标相对路径。
+type previewItem struct {
+	Src string // 源文件绝对路径
+	Rel string // 目标相对路径,如 "2026/08/IMG_20260817_104121_001.jpg"
+}
+
+// openInSystem 用系统默认程序打开文件/目录(跨平台)。
+func openInSystem(p string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", p)
+	case "darwin":
+		cmd = exec.Command("open", p)
+	default:
+		cmd = exec.Command("xdg-open", p)
+	}
+	return cmd.Start()
+}
+
+// showPreviewWindow 弹出树形预览窗口,按 年/月/日 目录树展示每个文件的源->目标映射。
+// items 按目标相对路径分组(值切片),键本身即相对路径。
+func showPreviewWindow(items map[string][]previewItem) {
+	// 展平所有条目并排序,保证树展示顺序稳定
+	type entry struct {
+		src string
+		rel string
+	}
+	var all []entry
+	for _, list := range items {
+		for _, it := range list {
+			all = append(all, entry{src: it.Src, rel: it.Rel})
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].rel < all[j].rel })
+
+	// 构建完整树: 节点ID = 相对路径或它的目录前缀
+	children := map[string][]string{}    // 节点ID -> 子节点ID
+	isBranch := map[string]bool{}        // 节点ID -> 是否为目录分支
+	leafSrc := map[string]string{}       // 叶子节点ID -> 源路径
+	var roots []string
+
+	addNode := func(id string, branch bool, src string) {
+		if _, seen := children[id]; seen {
+			// 已存在节点: 若本次要求作为分支而先前被当作叶子,需升级为分支
+			// (防止「同名文件 + 同名目录」时目录下的文件在树中丢失),并清理叶子源路径。
+			if branch && !isBranch[id] {
+				isBranch[id] = true
+				delete(leafSrc, id)
+			}
+			return
+		}
+		children[id] = []string{}
+		isBranch[id] = branch
+		if !branch {
+			leafSrc[id] = src
+		}
+	}
+
+	// 递归把相对路径拆成目录层级
+	for _, e := range all {
+		// 统一用 "/" 分隔,跨平台一致
+		parts := strings.Split(strings.ReplaceAll(e.rel, "\\", "/"), "/")
+		var cur string
+		for i, p := range parts {
+			if i == 0 {
+				cur = p
+			} else {
+				cur = cur + "/" + p
+			}
+			branch := i < len(parts)-1
+			addNode(cur, branch, "")
+			if i == 0 {
+				// 根节点
+				if !containsStr(roots, cur) {
+					roots = append(roots, cur)
+				}
+			} else {
+				parent := strings.TrimSuffix(cur, "/"+p)
+				if !containsStr(children[parent], cur) {
+					children[parent] = append(children[parent], cur)
+				}
+			}
+		}
+		// 叶子节点绑定源路径(若该路径已被识别为分支则跳过,保持分支语义)
+		if !isBranch[cur] {
+			leafSrc[cur] = e.src
+		}
+	}
+
+	// 树组件
+	tree := widget.NewTree(
+		func(id widget.TreeNodeID) []widget.TreeNodeID {
+			if id == "" {
+				return roots
+			}
+			return children[id]
+		},
+		func(id widget.TreeNodeID) bool {
+			return isBranch[id]
+		},
+		func(branch bool) fyne.CanvasObject {
+			if branch {
+				return widget.NewLabel("folder/")
+			}
+			return widget.NewLabel("file.ext")
+		},
+		func(id widget.TreeNodeID, branch bool, node fyne.CanvasObject) {
+			lbl := node.(*widget.Label)
+			base := id
+			if idx := strings.LastIndex(id, "/"); idx >= 0 {
+				base = id[idx+1:]
+			}
+			if branch {
+				lbl.SetText("📁 " + base)
+			} else {
+				src := leafSrc[id]
+				if src != "" {
+					lbl.SetText(base + "   ← " + filepath.Base(src))
+				} else {
+					lbl.SetText(base)
+				}
+			}
+		},
+	)
+	tree.OpenAllBranches()
+
+	// 统计面板
+	stat := widget.NewLabel(fmt.Sprintf("预览共 %d 个文件将按时间整理到目标目录\n(点击分支可折叠/展开,文件名后 ← 为源文件名)", len(all)))
+	stat.Wrapping = fyne.TextWrapWord
+
+	pw := fyne.CurrentApp().NewWindow("预览结果 — 整理后目录结构")
+	pw.Resize(fyne.NewSize(760, 560))
+	pw.SetContent(container.NewBorder(
+		container.NewVBox(stat, widget.NewSeparator()),
+		nil, nil, nil,
+		container.NewVScroll(tree),
+	))
+	pw.Show()
+}
+
+// containsStr 判断字符串切片是否包含指定元素。
+func containsStr(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }

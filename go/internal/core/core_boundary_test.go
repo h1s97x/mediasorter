@@ -4,6 +4,8 @@ package core
 import (
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -251,6 +253,47 @@ func TestRun_DryRunNoSideEffect(t *testing.T) {
 	// 源文件应保留
 	if _, err := os.Stat(filepath.Join(src, "a.jpg")); err != nil {
 		t.Error("DryRun 源文件应保留")
+	}
+}
+
+func TestRun_DryRunOnPreview(t *testing.T) {
+	// OnPreview 回调在 DryRun 下应逐文件回调源路径与目标相对路径;
+	// 非 DryRun(实际复制)不应调用 OnPreview。
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "a.jpg"), makeJpgWithExif("2024:01:01 00:00:00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "b.jpg"), makeJpgWithExif("2024:02:01 00:00:00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dst := t.TempDir()
+
+	// 预览: 应收集到 2 个源->目标映射,目标路径以 2024/01、2024/02 开头
+	var got []string
+	res := Run(Options{Src: src, Dst: dst, DryRun: true, Dedupe: false,
+		OnPreview: func(srcPath, relDstPath string) {
+			got = append(got, relDstPath)
+		}}, nil)
+	if res.Processed != 2 {
+		t.Fatalf("DryRun 期望处理 2,实际 %d", res.Processed)
+	}
+	if len(got) != 2 {
+		t.Fatalf("OnPreview 期望回调 2 次,实际 %d", len(got))
+	}
+	sort.Strings(got)
+	if !strings.HasPrefix(got[0], "2024/01/") || !strings.HasPrefix(got[1], "2024/02/") {
+		t.Errorf("OnPreview 目标路径应为 年/月 前缀,实际 %v", got)
+	}
+
+	// 非 DryRun(实际复制): OnPreview 不应被调用
+	hits := 0
+	run := Run(Options{Src: src, Dst: t.TempDir(), Dedupe: false,
+		OnPreview: func(srcPath, relDstPath string) { hits++ }}, nil)
+	if run.Processed != 2 {
+		t.Fatalf("正式整理期望处理 2,实际 %d", run.Processed)
+	}
+	if hits != 0 {
+		t.Errorf("非 DryRun 不应触发 OnPreview,实际 %d 次", hits)
 	}
 }
 
