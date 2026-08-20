@@ -1093,25 +1093,26 @@ func showPreviewWindow(items map[string][]previewItem) {
 			if idx := strings.LastIndex(id, "/"); idx >= 0 {
 				base = id[idx+1:]
 			}
+			// 注意: 不使用 emoji(📁) 或特殊箭头(←)等非 ASCII 字形,
+			// 它们在部分系统(尤其 Windows 默认字体)上会渲染成乱码/黑块。
 			if branch {
-				lbl.SetText("📁 " + base)
+				lbl.SetText("[+] " + base)
 			} else {
 				src := leafSrc[id]
 				if src != "" {
-					lbl.SetText(base + "   ← " + filepath.Base(src))
+					lbl.SetText(base + "   <-  " + filepath.Base(src))
 				} else {
 					lbl.SetText(base)
 				}
 			}
 		},
 	)
-	tree.OpenAllBranches()
 
-	// 统计面板
-	stat := widget.NewLabel(fmt.Sprintf("预览共 %d 个文件将按时间整理到目标目录\n(点击分支可折叠/展开,文件名后 ← 为源文件名)", len(all)))
+	// 统计面板(用 ASCII 箭头,避免乱码)
+	stat := widget.NewLabel(fmt.Sprintf("预览共 %d 个文件将按时间整理到目标目录\n(点击分支可折叠/展开,文件名后 '<-' 为源文件名)", len(all)))
 	stat.Wrapping = fyne.TextWrapWord
 
-	pw := fyne.CurrentApp().NewWindow("预览结果 — 整理后目录结构")
+	pw := fyne.CurrentApp().NewWindow("预览结果 - 整理后目录结构")
 	pw.Resize(fyne.NewSize(760, 560))
 	pw.SetContent(container.NewBorder(
 		container.NewVBox(stat, widget.NewSeparator()),
@@ -1119,6 +1120,16 @@ func showPreviewWindow(items map[string][]previewItem) {
 		container.NewVScroll(tree),
 	))
 	pw.Show()
+
+	// 关键修复: 必须在窗口完成首次布局之后再展开所有分支。
+	// Fyne 的 Tree 采用惰性加载,若在显示前调用 OpenAllBranches(),
+	// 此时分支尚未被加载器发现,展开会落空,导致树形区域一片空白。
+	// 通过 fyne.Do 把展开动作放到下一轮 UI 事件循环执行,
+	// 确保树已完成布局、根节点已被发现后再递归展开。
+	fyne.Do(func() {
+		tree.OpenAllBranches()
+		tree.Refresh()
+	})
 }
 
 // containsStr 判断字符串切片是否包含指定元素。
