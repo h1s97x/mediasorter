@@ -266,9 +266,18 @@ func main() {
 
 	// 高级区内容: 统一放进一个 VBox,展开/收起整体控制显示。
 	// 危险项(移动文件)用醒目标注提醒,避免误触。
+	// 处理格式从主窗口移入此处(默认收起),普通用户用默认『全部格式』即可。
 	moveLabel := widget.NewLabel("⚠ 危险操作")
 	moveLabel.Importance = widget.DangerImportance
 	advancedContent = container.NewVBox(
+		// —— 处理格式(参考图分组,已从主窗口收进高级区) ——
+		widget.NewLabel("处理格式:"),
+		container.NewHBox(formatAllChk),
+		container.NewHBox(formatPhotoAllChk, photoRow),
+		container.NewHBox(formatVideoAllChk, videoRow),
+		container.NewBorder(nil, nil, widget.NewLabel("其他格式:"), nil, customFormatEntry),
+		widget.NewSeparator(),
+		// —— 其余高级选项 ——
 		container.NewVBox(
 			moveLabel,
 			moveChk,
@@ -328,7 +337,9 @@ func main() {
 	status := widget.NewLabel("就绪。可先点『预览』查看效果,确认后再『开始整理』。")
 
 	previewBtn := widget.NewButton("预览", nil)
+	// 主按钮『开始整理』: 强调色放大,一眼定位。
 	startBtn := widget.NewButton("开始整理", nil)
+	startBtn.Importance = widget.HighImportance
 	cancelBtn := widget.NewButton("取消", nil)
 	cancelBtn.Disable()
 
@@ -822,20 +833,35 @@ func main() {
 		}
 	})
 
-	// 底部布局: 按钮行(含打开日志)、进度条、状态。日志已改为落盘,不再占用界面空间。
+	// 『更多』菜单: 收纳取消/导出失败清单/打开日志等辅助操作,不再主窗口平铺。
+	// 各辅助按钮(取消/导出/打开日志)通过该弹出菜单按需启用/禁用。
+	moreBtn := widget.NewButton("…", nil)
+	moreMenu := fyne.NewMenu("更多",
+		fyne.NewMenuItem("取消", cancelBtn.OnTapped),
+		fyne.NewMenuItem("导出失败清单", exportBtn.OnTapped),
+		fyne.NewMenuItem("打开日志", openLogBtn.OnTapped),
+	)
+	moreBtn.OnTapped = func() {
+		// 每次弹出前同步菜单项启用状态,与对应按钮保持一致。
+		moreMenu.Items[0].Disabled = cancelBtn.Disabled()
+		moreMenu.Items[1].Disabled = exportBtn.Disabled()
+		moreMenu.Items[2].Disabled = openLogBtn.Disabled()
+		widget.ShowPopUpMenuAtRelativePosition(moreMenu, w.Canvas(), fyne.NewPos(0, moreBtn.Size().Height), moreBtn)
+	}
+
+	// 主窗口布局: 只留「三步走」核心流程,其余全部收进『高级选项』/『更多』。
 	content := container.NewVScroll(
 		container.NewVBox(
-			container.NewBorder(nil, nil, widget.NewLabel("源文件夹:"), srcBtn, srcEntry),
-			container.NewBorder(nil, nil, widget.NewLabel("目标文件夹:"), dstBtn, dstEntry),
-			container.NewHBox(widget.NewLabel("目录结构:"), modeGroup),
-			// 处理格式分组(参考图): 全部格式 / 全部图片+图片行 / 全部视频+视频行 / 其他格式
-			container.NewHBox(widget.NewLabel("处理格式:"), formatAllChk),
-			container.NewHBox(formatPhotoAllChk, photoRow),
-			container.NewHBox(formatVideoAllChk, videoRow),
-			container.NewBorder(nil, nil, widget.NewLabel("其他格式:"), nil, customFormatEntry),
-			container.NewHBox(advancedBtn), // 『高级选项』折叠开关
-			advancedContent,                // 高级区内容(默认隐藏,展开时才显示)
-			container.NewHBox(previewBtn, startBtn, cancelBtn, exportBtn, openLogBtn),
+			// ① 源文件夹
+			container.NewBorder(nil, nil, widget.NewLabel("① 选择要整理的照片/视频文件夹:"), srcBtn, srcEntry),
+			// ② 目标文件夹(可选)
+			container.NewBorder(nil, nil, widget.NewLabel("② 整理到(留空=源目录旁 MediaSorter):"), dstBtn, dstEntry),
+			// ③ 目录结构(保留单选,紧凑竖排) + 高级选项入口
+			container.NewHBox(widget.NewLabel("③ 目录结构:"), modeGroup, advancedBtn),
+			advancedContent, // 高级区内容(默认隐藏,展开时才显示)
+			// 两个主按钮: 预览(次要)+开始整理(主按钮强调色)
+			container.NewHBox(previewBtn, startBtn, moreBtn),
+			// 进度反馈内嵌单行
 			progress,
 			scanProgress,
 			status,
