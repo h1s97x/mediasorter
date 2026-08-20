@@ -12,6 +12,7 @@
 - **修复运行结束按钮状态**：关闭日志通道后恢复按钮可用并输出最终状态
 - **按钮灰化兜底**：防止运行期间按钮状态异常
 - **修复构建问题**：修复 GUI 编译报错 `undefined: advancedBtn`(闭包作用域),恢复 Linux/Windows GUI 可构建
+- **修复构建问题**：修复 GUI 编译报错 `undefined: advancedContent`(同源闭包作用域),确保 Windows GUI 可构建
 
 ### 质量加固
 

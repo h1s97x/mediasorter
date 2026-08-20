@@ -162,7 +162,9 @@ func main() {
 	advancedOpen := false
 	// 先声明后赋值: 闭包回调在按钮被点击时才执行,彼时 advancedBtn 已指向按钮实例;
 	// 若在同一条 := 语句的初始化闭包内引用自身,会因作用域未生效报 "undefined: advancedBtn"。
+	// 同理,advancedContent 需先声明后赋值,否则闭包内引用会报 "undefined: advancedContent"。
 	var advancedBtn *widget.Button
+	var advancedContent *fyne.Container
 	advancedBtn = widget.NewButton("高级选项 ▸", func() {
 		advancedOpen = !advancedOpen
 		if advancedOpen {
@@ -178,7 +180,7 @@ func main() {
 	// 危险项(移动文件)用醒目标注提醒,避免误触。
 	moveLabel := widget.NewLabel("⚠ 危险操作")
 	moveLabel.Importance = widget.DangerImportance
-	advancedContent := container.NewVBox(
+	advancedContent = container.NewVBox(
 		container.NewVBox(
 			moveLabel,
 			moveChk,
