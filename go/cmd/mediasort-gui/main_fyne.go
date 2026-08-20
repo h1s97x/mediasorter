@@ -33,7 +33,7 @@ import (
 func main() {
 	a := app.New()
 	w := a.NewWindow("MediaSorterGo - 按拍摄时间整理照片视频")
-	w.Resize(fyne.NewSize(820, 720))
+	w.Resize(fyne.NewSize(700, 440))
 
 	srcEntry := widget.NewEntry()
 	srcEntry.SetPlaceHolder("手机导出的照片文件夹(可整个 U 盘,也可直接拖放到窗口)")
@@ -374,6 +374,7 @@ func main() {
 	scanProgress := widget.NewProgressBarInfinite()
 	scanProgress.Hide() // 默认隐藏,扫描阶段才显示
 	status := widget.NewLabel("就绪。可先点『预览』查看效果,确认后再『开始整理』。")
+	status.Wrapping = fyne.TextWrapWord
 
 	previewBtn := widget.NewButton("预览", nil)
 	// 主按钮『开始整理』: 强调色放大,一眼定位。
@@ -943,21 +944,40 @@ func main() {
 	}
 
 	// 主窗口布局: 只留「三步走」核心流程,其余全部收进『高级选项』/『更多』。
-	content := container.NewVScroll(
-		container.NewVBox(
-			// ① 源文件夹
-			container.NewBorder(nil, nil, widget.NewLabel("① 选择要整理的照片/视频文件夹:"), srcBtn, srcEntry),
-			// ② 目标文件夹(可选)
-			container.NewBorder(nil, nil, widget.NewLabel("② 整理到(留空=源目录旁 MediaSorter):"), dstBtn, dstEntry),
-			// ③ 目录结构(下拉选择,紧凑) + 高级选项入口
-			container.NewHBox(widget.NewLabel("③ 目录结构:"), modeSelect, advancedBtn),
-			advancedContent, // 高级区内容(默认隐藏,展开时才显示)
-			// 两个主按钮: 预览(次要)+开始整理(主按钮强调色)
-			container.NewHBox(previewBtn, startBtn, moreBtn),
-			// 进度反馈内嵌单行
-			progress,
-			scanProgress,
-			status,
+	// 用 Border 布局固定底部进度/状态区,主内容区可滚动,窗口缩放时不再留大片空白。
+	// 每个字段 label 独立一行,输入框 + 按钮并排,视觉更清晰、不拥挤。
+	mainForm := container.NewVBox(
+		// ① 源文件夹
+		widget.NewLabel("① 要整理的文件夹"),
+		container.NewBorder(nil, nil, nil, srcBtn, srcEntry),
+		// ② 目标文件夹(可选)
+		widget.NewLabel("② 整理到(可选)"),
+		container.NewBorder(nil, nil, nil, dstBtn, dstEntry),
+		// ③ 目录结构(下拉选择,紧凑) + 高级选项入口
+		container.NewHBox(widget.NewLabel("③ 目录结构:"), modeSelect, advancedBtn),
+	)
+	// 底部反馈区: 按钮 + 进度条 + 状态,固定在窗口底部
+	// 主按钮居中突出,辅助按钮靠右收进「…」
+	btnRow := container.NewCenter(
+		container.NewHBox(previewBtn, startBtn, moreBtn),
+	)
+	bottomArea := container.NewVBox(
+		btnRow,
+		progress,
+		scanProgress,
+		status,
+	)
+	content := container.NewBorder(
+		nil,
+		bottomArea,
+		nil,
+		nil,
+		container.NewVScroll(
+			container.NewVBox(
+				mainForm,
+				widget.NewSeparator(),
+				advancedContent, // 高级区内容(默认隐藏,展开时才显示)
+			),
 		),
 	)
 	w.SetContent(content)
